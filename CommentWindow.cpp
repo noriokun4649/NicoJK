@@ -499,7 +499,7 @@ void CCommentWindow::OnParentSize()
 
 // コメントを1つだけ追加する
 void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION position,
-                             CHAT_SIZE size, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay, bool isSelfComment)
+                             CHAT_SIZE size, bool isSelfComment, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay)
 {
 	if (hwnd_) {
 		std::list<CHAT> lc(1);
