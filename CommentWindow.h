@@ -54,7 +54,7 @@ public:
 	void OnParentMove();
 	void OnParentSize();
 	void AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION position, CHAT_SIZE size = CHAT_SIZE_DEFAULT,
-	             CHAT_ALIGN align = CHAT_ALIGN_CENTER, bool bInsertLast = false, BYTE backOpacity = 0, int delay = 0);
+	             CHAT_ALIGN align = CHAT_ALIGN_CENTER, bool bInsertLast = false, BYTE backOpacity = 0, int delay = 0, bool isSelfComment = false);
 	void ScatterLatestChats(int duration);
 	void ClearChat();
 	void Forward(int duration);
@@ -80,6 +80,7 @@ private:
 		int currentDrawWidth;
 		int currentDrawHeight;
 		tstring text;
+		bool isSelfComment;
 	};
 	struct TEXTURE {
 		bool bUsed;
