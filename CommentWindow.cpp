@@ -505,7 +505,7 @@ void CCommentWindow::OnParentSize()
 
 // コメントを1つだけ追加する
 void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION position,
-                             CHAT_SIZE size, bool isSelfComment, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay)
+                             CHAT_SIZE size, bool bSelfComment, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay)
 {
 	if (hwnd_) {
 		std::list<CHAT> lc(1);
@@ -532,7 +532,7 @@ void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION positio
 			}
 		}
 		c.bDrew = false;
-		c.isSelfComment = isSelfComment;
+		c.bSelfComment = bSelfComment;
 		// 一時リストに追加(描画時にchatList_にマージ)
 		lock_recursive_mutex lock(chatLock_);
 		chatPoolList_.splice(chatPoolList_.end(), lc);
@@ -1150,7 +1150,7 @@ void CCommentWindow::DrawChat(Gdiplus::Graphics &g, int width, int height, RECT 
 			}
 			
 			//自分のコメントの場合コメントを枠で囲む
-			if (!hideCommentHighlight_ && it->isSelfComment) {
+			if (!hideCommentHighlight_ && it->bSelfComment) {
 				Gdiplus::RectF        rectF((Gdiplus::REAL)px, (Gdiplus::REAL)py+5, (Gdiplus::REAL)entireDrawWith, (Gdiplus::REAL)entireDrawHeight-10);
 				Gdiplus::SolidBrush   solidBrush(Gdiplus::Color(255, 0, 0, 255));
 				Gdiplus::Pen pen(Gdiplus::Color(228, 228, 0), 2.0F * height/300);
