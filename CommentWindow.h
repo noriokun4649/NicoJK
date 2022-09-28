@@ -50,6 +50,7 @@ public:
 	void SetDisplayDuration(int duration);
 	BYTE GetOpacity() const { return opacity_; }
 	void SetOpacity(BYTE opacity);
+	void SetCommentHighlight(bool commentHighligh);
 	void SetDebugFlags(int debugFlags);
 	void OnParentMove();
 	void OnParentSize();
@@ -165,4 +166,5 @@ private:
 	RECT rcDirty_;
 	bool bForceRefreshDirty_;
 	int debugFlags_;
+	bool hideCommentHighlight_;
 };

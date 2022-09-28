@@ -397,6 +397,12 @@ void CCommentWindow::SetDebugFlags(int debugFlags)
 	debugFlags_ = debugFlags;
 }
 
+void CCommentWindow::SetCommentHighlight(bool commentHighligh)
+{
+	WaitForIdleDrawingThread();
+	hideCommentHighlight_ = commentHighligh;
+}
+
 // 作業用ビットマップを確保
 bool CCommentWindow::AllocateWorkBitmap(int width, int height, bool *pbRealloc)
 {
@@ -1144,7 +1150,7 @@ void CCommentWindow::DrawChat(Gdiplus::Graphics &g, int width, int height, RECT 
 			}
 			
 			//自分のコメントの場合コメントを枠で囲む
-			if (it->isSelfComment) {
+			if (!hideCommentHighlight_ && it->isSelfComment) {
 				Gdiplus::RectF        rectF(px, py+5, entireDrawWith, entireDrawHeight-10);
 				Gdiplus::SolidBrush   solidBrush(Gdiplus::Color(255, 0, 0, 255));
 				Gdiplus::Pen pen(Gdiplus::Color(228, 228, 0), 2.0F * height/300);
