@@ -7,7 +7,8 @@
 #include "ImportLogUtil.h"
 #include "Util.h"
 #include "JKStream.h"
-#include "TextFileReader.h"
+#include "JKTransfer.h"
+#include "LogReader.h"
 #include "CommentWindow.h"
 #define TVTEST_PLUGIN_CLASS_IMPLEMENT
 #include "TVTestPlugin.h"
@@ -39,6 +40,7 @@ inline void dprintf_real( const _TCHAR * fmt, ... )
 // 通信用
 #define WMS_FORCE (WM_APP + 101)
 #define WMS_JK (WM_APP + 102)
+#define WMS_TRANSFER (WM_APP + 103)
 
 #define WM_RESET_STREAM (WM_APP + 105)
 #define WM_UPDATE_LIST (WM_APP + 106)
@@ -122,17 +124,13 @@ CNicoJK::CNicoJK()
 	, currentJKForceByChatCountTick_(0)
 	, lastPostTick_(0)
 	, bRecording_(false)
+	, hQuitCheckRecordingEvent_(nullptr)
 	, bUsingLogfileDriver_(false)
 	, bSetStreamCallback_(false)
 	, bResyncComment_(false)
 	, currentLogfileJK_(-1)
 	, hLogfile_(INVALID_HANDLE_VALUE)
 	, hLogfileLock_(INVALID_HANDLE_VALUE)
-	, currentReadLogfileJK_(-1)
-	, tmZippedLogfileCachedLast_(0)
-	, bReadLogTextNext_(false)
-	, tmReadLogText_(0)
-	, readLogfileTick_(0)
 	, llftTot_(-1)
 	, pcr_(0)
 	, pcrTick_(0)
@@ -142,8 +140,7 @@ CNicoJK::CNicoJK()
 {
 	cookie_[0] = '\0';
 	lastPostComm_[0] = TEXT('\0');
-	readLogText_[0][0] = '\0';
-	readLogText_[1][0] = '\0';
+	logReader_.SetCheckIntervalMsec(READ_LOG_FOLDER_INTERVAL);
 	SETTINGS s = {};
 	s_ = s;
 	pcrPids_[0] = -1;
@@ -197,6 +194,7 @@ bool CNicoJK::Initialize()
 		TCHAR ext[32];
 		_stprintf_s(ext, TEXT("_%u.tmp"), GetCurrentProcessId());
 		tmpSpecFileName_ += ext;
+		logReader_.SetJK0LogfilePath(tmpSpecFileName_.c_str());
 	}
 	// OsdCompositorは他プラグインと共用することがあるので、有効にするならFinalize()まで破棄しない
 	bool bEnableOsdCompositor = GetPrivateProfileInt(TEXT("Setting"), TEXT("enableOsdCompositor"), 0, iniFileName_.c_str()) != 0;
@@ -388,6 +386,35 @@ void CNicoJK::SyncThread()
 	}
 }
 
+void CNicoJK::CheckRecordingThread(DWORD processID)
+{
+	const DWORD CMD_SUCCESS = TRUE;
+	const DWORD VIEW_APP_ST_REC = 2;
+	const DWORD cmdViewAppGetStatus[] = {207, 0};
+	TCHAR pipeName[64];
+	_stprintf_s(pipeName, TEXT("\\\\.\\pipe\\View_Ctrl_BonNoWaitPipe_%d"), processID);
+
+	while (WaitForSingleObject(hQuitCheckRecordingEvent_, 2000) == WAIT_TIMEOUT) {
+		// EDCBのCtrlCmdインタフェースにアクセスしてその録画状態を調べる
+		HANDLE pipe = CreateFile(pipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (pipe != INVALID_HANDLE_VALUE) {
+			DWORD n;
+			if (WriteFile(pipe, cmdViewAppGetStatus, sizeof(cmdViewAppGetStatus), &n, nullptr) && n == sizeof(cmdViewAppGetStatus)) {
+				DWORD res[3];
+				n = 0;
+				for (DWORD m; n < sizeof(res) && ReadFile(pipe, reinterpret_cast<BYTE*>(res) + n, sizeof(res) - n, &m, nullptr); n += m);
+				if (n == sizeof(res) && res[0] == CMD_SUCCESS) {
+					bRecording_ = res[2] == VIEW_APP_ST_REC;
+				}
+			}
+			CloseHandle(pipe);
+		} else if (GetLastError() != ERROR_PIPE_BUSY) {
+			break;
+		}
+	}
+	bRecording_ = false;
+}
+
 void CNicoJK::ToggleStreamCallback(bool bSet)
 {
 	if (bSet) {
@@ -442,7 +469,9 @@ void CNicoJK::LoadFromIni()
 	s_.bCommentFontAntiAlias = GetBufferedProfileInt(buf.data(), TEXT("commentFontAntiAlias"), 1) != 0;
 	s_.commentDuration		= GetBufferedProfileInt(buf.data(), TEXT("commentDuration"), CCommentWindow::DISPLAY_DURATION);
 	s_.commentDrawLineCount = GetBufferedProfileInt(buf.data(), TEXT("commentDrawLineCount"), CCommentWindow::DEFAULT_LINE_DRAW_COUNT);
+	s_.commentShareMode		= GetBufferedProfileInt(buf.data(), TEXT("commentShareMode"), 0);
 	s_.logfileMode			= GetBufferedProfileInt(buf.data(), TEXT("logfileMode"), 0);
+	s_.bCheckProcessRecording = GetBufferedProfileInt(buf.data(), TEXT("checkProcessRecording"), 1) != 0;
 	s_.logfileDrivers		= GetBufferedProfileToString(buf.data(), TEXT("logfileDrivers"),
 							                             TEXT("BonDriver_UDP.dll:BonDriver_TCP.dll:BonDriver_File.dll:BonDriver_RecTask.dll:BonDriver_TsTask.dll:")
 							                             TEXT("BonDriver_NetworkPipe.dll:BonDriver_Pipe.dll:BonDriver_Pipe2.dll"));
@@ -491,6 +520,7 @@ void CNicoJK::LoadFromIni()
 	if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
 		s_.logfileFolder.clear();
 	}
+	logReader_.SetLogDirectory(s_.logfileFolder.c_str());
 
 	buf = GetPrivateProfileSectionBuffer(TEXT("Window"), iniFileName_.c_str());
 	s_.rcForce.left			= GetBufferedProfileInt(buf.data(), TEXT("ForceX"), 0);
@@ -838,7 +868,8 @@ void CNicoJK::WriteToLogfile(int jkID, const char *text)
 		TCHAR name[64];
 		_stprintf_s(name, TEXT("\\jk%d"), jkID);
 		tstring path = s_.logfileFolder + name;
-		if (GetChatDate(&tm, text) && (GetFileAttributes(path.c_str()) != INVALID_FILE_ATTRIBUTES || CreateDirectory(path.c_str(), nullptr))) {
+		if (CLogReader::GetChatDate(&tm, text) &&
+		    (GetFileAttributes(path.c_str()) != INVALID_FILE_ATTRIBUTES || CreateDirectory(path.c_str(), nullptr))) {
 			// ロックファイルを開く
 			path += TEXT("\\lockfile");
 			hLogfileLock_ = CreateFile(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -879,185 +910,20 @@ static inline int CounterDiff(DWORD a, DWORD b)
 	return (a - b) & 0x80000000 ? -static_cast<int>(b - a - 1) - 1 : static_cast<int>(a - b);
 }
 
-// 指定した実況IDの指定時刻のログ1行を読み込む
-// jkIDが負値のときはログファイルを閉じる
-// jkID==0は指定ファイル再生(tmpSpecFileName_)を表す特殊な実況IDとする
-// jkID>=0のときtextは必須。戻り値が真のとき*textは次にこのメソッドを呼ぶまで有効
 bool CNicoJK::ReadFromLogfile(int jkID, const char **text, unsigned int tmToRead)
 {
-	if (jkID != 0 && (s_.logfileFolder.empty() || !bUsingLogfileDriver_)) {
-		// ログを読まない
-		jkID = -1;
-	}
-	DWORD tick = GetTickCount();
-	if (currentReadLogfileJK_ >= 0 && currentReadLogfileJK_ != jkID) {
-		// 閉じる
-		readLogfile_.Close();
-		readLogfileTick_ = tick;
-		currentReadLogfileJK_ = -1;
-		OutputMessageLog(TEXT("ログファイルの読み込みを終了しました。"));
-	}
-	if (CounterDiff(tick, readLogfileTick_) >= 0 && currentReadLogfileJK_ < 0 && jkID >= 0) {
-		// ファイルチェックを大量に繰りかえすのを防ぐ
-		readLogfileTick_ = tick + READ_LOG_FOLDER_INTERVAL;
-		tstring path;
-		const char *zippedName = nullptr;
-		TCHAR latestZip[16] = {};
-		if (jkID == 0) {
-			// 指定ファイル再生
-			path = tmpSpecFileName_;
+	return logReader_.Read(jkID, [this](LPCTSTR message) {
+		static const TCHAR started[] = TEXT("Started reading logfile: ");
+		if (!_tcsncmp(message, started, _tcslen(started))) {
+			TCHAR log[256];
+			_stprintf_s(log, TEXT("ログ\"%.191s\"の読み込みを開始しました。"), message + _tcslen(started));
+			OutputMessageLog(log);
+		} else if (!_tcscmp(message, TEXT("Closed logfile."))) {
+			OutputMessageLog(TEXT("ログファイルの読み込みを終了しました。"));
 		} else {
-			// jkIDのログファイル一覧を得る
-			TCHAR pattern[64];
-			_stprintf_s(pattern, TEXT("\\jk%d\\??????????.???"), jkID);
-			// tmToRead以前でもっとも新しいログファイルを探す
-			TCHAR target[16];
-			_stprintf_s(target, TEXT("%010u."), tmToRead + (READ_LOG_FOLDER_INTERVAL / 1000 + 2));
-			TCHAR latestTxt[16] = {};
-			EnumFindFile((s_.logfileFolder + pattern).c_str(), [&](const WIN32_FIND_DATA &fd) {
-				if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
-				    _tcscmp(fd.cFileName, target) < 0 &&
-				    _tcslen(fd.cFileName) == 14) {
-					if (!_tcsicmp(fd.cFileName + 10, TEXT(".txt"))) {
-						// テキスト形式のログ
-						if (_tcscmp(fd.cFileName, latestTxt) > 0) {
-							_tcscpy_s(latestTxt, fd.cFileName);
-						}
-					} else if (!_tcsicmp(fd.cFileName + 10, TEXT(".zip"))) {
-						// アーカイブされたログ
-						if (_tcscmp(fd.cFileName, latestZip) > 0) {
-							_tcscpy_s(latestZip, fd.cFileName);
-						}
-					}
-				}
-			});
-			if (latestTxt[0]) {
-				// 見つかった
-				_stprintf_s(pattern, TEXT("\\jk%d\\%s"), jkID, latestTxt);
-				path = s_.logfileFolder + pattern;
-			}
+			OutputMessageLog(message);
 		}
-
-		// まずテキスト形式のログを探す
-		if (!path.empty()) {
-			if (readLogfile_.Open(path.c_str())) {
-				// readLogText_[!bReadLogTextNext_]はメソッド内で汎用できる
-				char (&last)[CHAT_TAG_MAX] = readLogText_[!bReadLogTextNext_];
-				unsigned int tmLast;
-				// 最終行がtmToReadより過去なら読む価値無し
-				if (!readLogfile_.ReadLastLine(last, _countof(last)) || !GetChatDate(&tmLast, last) || tmLast < tmToRead) {
-					// 閉じる
-					readLogfile_.Close();
-				} else {
-					// まず2分探索
-					for (LONGLONG scale = 2; ; scale *= 2) {
-						char (&middle)[CHAT_TAG_MAX] = readLogText_[!bReadLogTextNext_];
-						int sign = 0;
-						for (;;) {
-							if (!readLogfile_.ReadLine(middle, _countof(middle))) {
-								break;
-							}
-							unsigned int tmMiddle;
-							if (GetChatDate(&tmMiddle, middle)) {
-								sign = tmMiddle + 10 > tmToRead ? -1 : 1;
-								break;
-							}
-						}
-						// 行の時刻が得られないか最初の行がすでに未来ならリセット
-						if (sign == 0 || sign < 0 && scale == 2) {
-							readLogfile_.ResetPointer();
-							break;
-						}
-						LONGLONG moveSize = readLogfile_.Seek(sign * scale);
-						dprintf(TEXT("CNicoJK::ReadFromLogfile() moveSize=%lld\n"), moveSize); // DEBUG
-						// 移動量が小さくなれば打ち切り
-						if (-32 * 1024 < moveSize && moveSize < 32 * 1024) {
-							// tmToReadよりも確実に過去になる位置まで戻す
-							readLogfile_.Seek(-scale);
-							// シーク直後の中途半端な1行を読み飛ばす
-							readLogfile_.ReadLine(middle, 1);
-							break;
-						}
-						readLogfile_.ReadLine(middle, 1);
-					}
-				}
-			}
-		}
-		// テキスト形式のログがなければアーカイブされたログを探す
-		if (!readLogfile_.IsOpen() && latestZip[0]) {
-			TCHAR pattern[64];
-			_stprintf_s(pattern, TEXT("\\jk%d\\%s"), jkID, latestZip);
-			path = s_.logfileFolder + pattern;
-			bool bSameResult;
-			zippedName = FindZippedLogfile(findZippedLogfileCache_, bSameResult, path.c_str(),
-			                               tmToRead + (READ_LOG_FOLDER_INTERVAL / 1000 + 2));
-			if (zippedName) {
-				// 前回と同じ結果のとき、キャッシュした最終行の時刻があれば使う
-				if (!bSameResult || tmZippedLogfileCachedLast_ == 0 || tmZippedLogfileCachedLast_ > tmToRead) {
-					// 読む必要がある。シークはできない
-					dprintf(TEXT("OpenZippedFile()\n")); // DEBUG
-					readLogfile_.OpenZippedFile(path.c_str(), zippedName);
-					tmZippedLogfileCachedLast_ = 0;
-				}
-			}
-		}
-		if (readLogfile_.IsOpen()) {
-			// tmToReadより過去の行を読み飛ばす
-			char (&next)[CHAT_TAG_MAX] = readLogText_[bReadLogTextNext_];
-			unsigned int tm = 0;
-			for (;;) {
-				if (!readLogfile_.ReadLine(next, _countof(next))) {
-					// 閉じる
-					readLogfile_.Close();
-					if (zippedName) {
-						// 最終行の時刻をキャッシュする
-						tmZippedLogfileCachedLast_ = tm;
-						dprintf(TEXT("tmZippedLogfileCachedLast_=%u\n"), tm); // DEBUG
-					}
-					break;
-				} else if (GetChatDate(&tmReadLogText_, next)) {
-					if (tmReadLogText_ > tmToRead) { // >=はダメ
-						currentReadLogfileJK_ = jkID;
-
-						TCHAR log[256];
-						size_t lastSep = path.find_last_of(TEXT("/\\"));
-						_stprintf_s(log, TEXT("ログ\"jk%d\\%.63s%s%S\"の読み込みを開始しました。"),
-						            jkID, &path.c_str()[lastSep == tstring::npos ? 0 : lastSep + 1],
-						            zippedName ? TEXT(":") : TEXT(""), zippedName ? zippedName : "");
-						OutputMessageLog(log);
-						break;
-					}
-					tm = tmReadLogText_;
-				}
-			}
-		}
-	}
-	bool bRet = false;
-	// 開いてたら読み込む
-	if (currentReadLogfileJK_ >= 0) {
-		if (readLogText_[bReadLogTextNext_][0] && tmReadLogText_ <= tmToRead) {
-			*text = readLogText_[bReadLogTextNext_];
-			bReadLogTextNext_ = !bReadLogTextNext_;
-			readLogText_[bReadLogTextNext_][0] = '\0';
-			bRet = true;
-		}
-		char (&next)[CHAT_TAG_MAX] = readLogText_[bReadLogTextNext_];
-		if (!next[0]) {
-			for (;;) {
-				if (!readLogfile_.ReadLine(next, _countof(next))) {
-					// 閉じる
-					readLogfile_.Close();
-					readLogfileTick_ = tick;
-					currentReadLogfileJK_ = -1;
-					OutputMessageLog(TEXT("ログファイルの読み込みを終了しました。"));
-					break;
-				} else if (GetChatDate(&tmReadLogText_, next)) {
-					break;
-				}
-			}
-		}
-	}
-	return bRet;
+	}, text, tmToRead);
 }
 
 static int GetWindowHeight(HWND hwnd)
@@ -1344,7 +1210,7 @@ bool CNicoJK::ProcessChatTag(const char *tag, bool bShow, int showDelay)
 	}
 	std::cmatch m, mm;
 	unsigned int tm;
-	if (std::regex_match(tag, m, reChat) && GetChatDate(&tm, tag)) {
+	if (std::regex_match(tag, m, reChat) && CLogReader::GetChatDate(&tm, tag)) {
 		TCHAR text[CHAT_TEXT_MAX];
 		int len = MultiByteToWideChar(CP_UTF8, 0, m[2].first, static_cast<int>(m[2].length()), text, _countof(text) - 1);
 		text[len] = TEXT('\0');
@@ -1832,7 +1698,7 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 			currentJKToGet_ = -1;
 			lastPostComm_[0] = TEXT('\0');
 			bUsingLogfileDriver_ = IsMatchDriverName(s_.logfileDrivers.c_str());
-			readLogfileTick_ = GetTickCount();
+			logReader_.ResetCheckInterval();
 			bSpecFile_ = false;
 			dropFileTimeout_ = 0;
 			SendMessage(hwnd, WM_RESET_STREAM, 0, 0);
@@ -1899,11 +1765,51 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 				SetTVTestPanelItem(GetDlgItem(hwnd, IDC_CHECK_SPECFILE), m_pApp, TVTestPanelButtonProc);
 				SetTVTestPanelItem(GetDlgItem(hwnd, IDC_CHECK_RELATIVE), m_pApp, TVTestPanelButtonProc);
 			}
+
+			if (s_.commentShareMode == 1 || s_.commentShareMode == 2 || s_.bCheckProcessRecording) {
+				// コマンドラインで指定されていればコメント共有の検索用プロセスIDを上書きする
+				DWORD processID = 0;
+				int argc;
+				LPTSTR *argv = CommandLineToArgvW(GetCommandLine(), &argc);
+				if (argv) {
+					for (int i = 1; i + 1 < argc; ++i) {
+						if (_tcsicmp(argv[i], TEXT("/jkshpid")) == 0 ||
+						    _tcsicmp(argv[i], TEXT("-jkshpid")) == 0) {
+							processID = _tcstoul(argv[i + 1], nullptr, 10);
+							if (processID != 0 && s_.bCheckProcessRecording) {
+								// 録画状態をチェックするスレッドを起動
+								hQuitCheckRecordingEvent_ = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+								if (hQuitCheckRecordingEvent_) {
+									checkRecordingThread_ = std::thread([this, processID]() { CheckRecordingThread(processID); });
+								}
+							}
+							break;
+						}
+					}
+					LocalFree(argv);
+				}
+				if (processID == 0) {
+					processID = GetCurrentProcessId();
+				}
+				if (s_.commentShareMode == 1 || s_.commentShareMode == 2) {
+					// 投稿機能は投稿欄を表示しているときだけ
+					if (!jkTransfer_.Open(hwnd, WMS_TRANSFER, s_.commentShareMode == 2 && cookie_[0], processID)) {
+						m_pApp->AddLog(L"設定commentShareModeを有効にできませんでした。", TVTest::LOG_TYPE_WARNING);
+					}
+				}
+			}
 			return TRUE;
 		}
 		return FALSE;
 	case WM_DESTROY:
 		{
+			// 録画状態をチェックするスレッドを終了
+			if (hQuitCheckRecordingEvent_) {
+				SetEvent(hQuitCheckRecordingEvent_);
+				checkRecordingThread_.join();
+				CloseHandle(hQuitCheckRecordingEvent_);
+				hQuitCheckRecordingEvent_ = nullptr;
+			}
 			// パネルアイテムのサブクラス化を解除
 			if (hPanel_) {
 				ResetTVTestPanelItem(GetDlgItem(hwnd, IDC_RADIO_FORCE));
@@ -1938,8 +1844,10 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 
 			channelStream_.BeginClose();
 			jkStream_.BeginClose();
+			jkTransfer_.BeginClose();
 			channelStream_.Close();
 			jkStream_.Close();
+			jkTransfer_.Close();
 			currentJK_ = -1;
 
 			if (syncThread_.joinable()) {
@@ -2109,7 +2017,7 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 					    FileOpenDialog(hwnd, TEXT("実況ログ(*.jkl;*.xml)\0*.jkl;*.xml\0すべてのファイル\0*.*\0"), path, _countof(path)) &&
 					    !bSpecFile_ && ImportLogfile(path, tmpSpecFileName_.c_str(), bRel ? FileTimeToUnixTime(llft) + 2 : 0))
 					{
-						readLogfileTick_ = GetTickCount();
+						logReader_.ResetCheckInterval();
 						bSpecFile_ = true;
 					}
 				}
@@ -2327,9 +2235,13 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 					const char *text;
 					LONGLONG tm = FileTimeToUnixTime(llft);
 					tm = min(max(forwardOffset_ < 0 ? tm - (-forwardOffset_ / 1000) : tm + forwardOffset_ / 1000, 0LL), UINT_MAX - 3600LL);
-					while (ReadFromLogfile(bSpecFile_ ? 0 : currentJKToGet_, &text, static_cast<unsigned int>(tm))) {
+					while (ReadFromLogfile(bSpecFile_ ? 0 : bUsingLogfileDriver_ ? currentJKToGet_ : -1, &text, static_cast<unsigned int>(tm))) {
 						ProcessChatTag(text);
 						bRead = true;
+						if (!logReader_.IsOpen()) {
+							// 次の読み込みは確実に失敗するので省略
+							break;
+						}
 					}
 					if (bRead) {
 						// date属性値は秒精度しかないのでコメント表示が団子にならないよう適当にごまかす
@@ -2370,7 +2282,7 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 				if (!bRel || (llft = GetCurrentTot()) >= 0) {
 					KillTimer(hwnd, TIMER_OPEN_DROPFILE);
 					if (ImportLogfile(dropFileName_.c_str(), tmpSpecFileName_.c_str(), bRel ? FileTimeToUnixTime(llft) + 2 : 0)) {
-						readLogfileTick_ = GetTickCount();
+						logReader_.ResetCheckInterval();
 						bSpecFile_ = true;
 						SendDlgItemMessage(hwnd, IDC_CHECK_SPECFILE, BM_SETCHECK, BST_CHECKED, 0);
 					}
@@ -2549,7 +2461,7 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 		return TRUE;
 	case WMS_JK:
 		{
-			static const std::regex reChatResult("^<chat_result(?= )[^>]*? status=\"(?!0\")(\\d+)\"");
+			static const std::regex reChatResult("^<chat_result(?= )[^>]*? status=\"(\\d+)\"");
 			static const std::regex reXRoom("^<x_room ");
 			static const std::regex reNickname("^<x_room(?= )[^>]*? nickname=\"(.*?)\"");
 			static const std::regex reIsLoggedIn("^<x_room(?= )[^>]*? is_logged_in=\"1\"");
@@ -2570,8 +2482,8 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 						break;
 					}
 					*itEnd = '\0';
-					if (itEnd - it >= CHAT_TAG_MAX) {
-						*(it + CHAT_TAG_MAX - 1) = '\0';
+					if (itEnd - it >= CLogReader::CHAT_TAG_MAX) {
+						*(it + CLogReader::CHAT_TAG_MAX - 1) = '\0';
 					}
 					const char *rpl = &*it;
 					if (!strncmp(rpl, "<chat ", 6)) {
@@ -2579,16 +2491,21 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 						if (ProcessChatTag(rpl, !bSpecFile_, static_cast<int>(min(max(-forwardOffset_, 0LL), 30000LL)))) {
 							dprintf(TEXT("#")); // DEBUG
 							WriteToLogfile(currentJK_, rpl);
+							jkTransfer_.SendChat(currentJK_, rpl);
 							++currentJKChatCount_;
 							bRead = true;
 						}
 					} else {
 						std::cmatch m;
 						if (std::regex_search(rpl, m, reChatResult)) {
-							// コメント投稿失敗の応答を取得した
-							TCHAR text[64];
-							_stprintf_s(text, TEXT("Error:コメント投稿に失敗しました(status=%d)。"), strtol(m[1].first, nullptr, 10));
-							OutputMessageLog(text);
+							// コメント投稿の応答を取得した
+							int status = strtol(m[1].first, nullptr, 10);
+							if (status != 0) {
+								TCHAR text[64];
+								_stprintf_s(text, TEXT("Error:コメント投稿に失敗しました(status=%d)。"), status);
+								OutputMessageLog(text);
+							}
+							jkTransfer_.SendChat(currentJK_, rpl);
 						} else if (std::regex_search(rpl, reXRoom)) {
 							// 接続情報を取得した
 							TCHAR nickname[64];
@@ -2614,6 +2531,41 @@ LRESULT CNicoJK::ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM
 				}
 				if (bRead && bDisplayLogList_) {
 					SendMessage(hwnd, WM_UPDATE_LIST, FALSE, 0);
+				}
+			}
+		}
+		return TRUE;
+	case WMS_TRANSFER:
+		{
+			std::string u8post = jkTransfer_.ProcessRecvPost();
+			size_t mailEndPos = u8post.find(']');
+			if (mailEndPos != std::string::npos && u8post[0] == '[') {
+				if (GetTickCount() - lastPostTick_ < POST_COMMENT_INTERVAL) {
+					OutputMessageLog(TEXT("Error:投稿間隔が短すぎます。"));
+					jkTransfer_.SendChat(currentJK_, "<!-- M=Post error! Short interval. -->");
+				} else if (u8post.size() - mailEndPos - 1 > 0) {
+					TCHAR comm[POST_COMMENT_MAX + 1];
+					int len = MultiByteToWideChar(CP_UTF8, 0, u8post.c_str() + mailEndPos + 1, -1, comm, _countof(comm) - 1);
+					comm[len] = TEXT('\0');
+					if (!comm[0]) {
+						OutputMessageLog(TEXT("Error:投稿コメントが長すぎます。"));
+						jkTransfer_.SendChat(currentJK_, "<!-- M=Post error! Too long. -->");
+					} else if (!_tcscmp(comm, lastPostComm_)) {
+						OutputMessageLog(TEXT("Error:投稿コメントが前回と同じです。"));
+						jkTransfer_.SendChat(currentJK_, "<!-- M=Post error! Same as previous. -->");
+					} else {
+						if (s_.bAnonymity) {
+							u8post.insert(mailEndPos, " 184");
+						}
+						// コメント投稿
+						if (jkStream_.Send(hwnd, WMS_JK, '+', u8post.c_str())) {
+							lastPostTick_ = GetTickCount();
+							_tcscpy_s(lastPostComm_, comm);
+						} else {
+							OutputMessageLog(TEXT("Error:コメントサーバに接続していません。"));
+							jkTransfer_.SendChat(currentJK_, "<!-- M=Post error! Not connected. -->");
+						}
+					}
 				}
 			}
 		}

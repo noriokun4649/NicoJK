@@ -11,9 +11,6 @@ public:
 	static const int COMMENT_TRIMEND = 1000;
 	// リストボックスのログ表示の最小描画間隔
 	static const int COMMENT_REDRAW_INTERVAL = 250;
-	// 処理できるchatタグの最大文字数(char)
-	// (既定値はコメントの制限を1024文字として、これが実体参照であった場合の*5にマージンを加えた値)
-	static const int CHAT_TAG_MAX = 1024 * 6;
 	// 表示できるコメントの最大文字数(超えると単なる空コメントとして表示される)
 	static const int CHAT_TEXT_MAX = 2048;
 	// 勢いリストを更新する間隔(あんまり短くしちゃダメ!)
@@ -52,7 +49,9 @@ private:
 		bool bCommentFontAntiAlias;
 		int commentDuration;
 		int commentDrawLineCount;
+		int commentShareMode;
 		int logfileMode;
+		bool bCheckProcessRecording;
 		tstring logfileDrivers;
 		tstring nonTunerDrivers;
 		tstring logfileFolder;
@@ -105,6 +104,7 @@ private:
 	bool TogglePlugin(bool bEnabled);
 	void ToggleStreamCallback(bool bSet);
 	void SyncThread();
+	void CheckRecordingThread(DWORD processID);
 	static std::vector<NETWORK_SERVICE_ID_ELEM>::iterator LowerBoundNetworkServiceID(std::vector<NETWORK_SERVICE_ID_ELEM>::iterator first,
 	                                                                                 std::vector<NETWORK_SERVICE_ID_ELEM>::iterator last, DWORD ntsID);
 	static std::vector<FORCE_ELEM>::iterator LowerBoundJKID(std::vector<FORCE_ELEM>::iterator first,
@@ -169,6 +169,7 @@ private:
 	// 通信用
 	CJKStream channelStream_;
 	CJKStream jkStream_;
+	CJKTransfer jkTransfer_;
 	std::vector<char> channelBuf_;
 	std::vector<char> jkBuf_;
 	int currentJKToGet_;
@@ -180,21 +181,16 @@ private:
 	TCHAR lastPostComm_[POST_COMMENT_MAX];
 
 	// 過去ログ関係
-	bool bRecording_;
+	std::atomic_bool bRecording_;
+	std::thread checkRecordingThread_;
+	HANDLE hQuitCheckRecordingEvent_;
 	bool bUsingLogfileDriver_;
 	bool bSetStreamCallback_;
 	bool bResyncComment_;
 	int currentLogfileJK_;
 	HANDLE hLogfile_;
 	HANDLE hLogfileLock_;
-	int currentReadLogfileJK_;
-	FIND_LOGFILE_CACHE findZippedLogfileCache_;
-	unsigned int tmZippedLogfileCachedLast_;
-	CTextFileReader readLogfile_;
-	char readLogText_[2][CHAT_TAG_MAX];
-	bool bReadLogTextNext_;
-	unsigned int tmReadLogText_;
-	DWORD readLogfileTick_;
+	CLogReader logReader_;
 	LONGLONG llftTot_;
 	LONGLONG llftTotLast_;
 	LONGLONG llftTotPending_;

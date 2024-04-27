@@ -20,6 +20,13 @@ NicoJK.tvtpおよびNicoJK.iniをTVTestのPluginフォルダに入れてくだ�
 に保存されていきます。録画中に受信した実況コメントがファイル再生プラグイン(何で
 もいい)で再生中に表示されればOKです。
 
+おもにEpgDataCap_Bonの"Viewボタン"に協調する機能として、/jkshpid起動オプションを
+用意しています。TVTestを
+> TVTest.exe /jkshpid {EpgDataCap_BonのプロセスID}
+のように起動することでEpgDataCap_Bonの録画状態に応じたログの記録や、EDCBのWebUI
+に対するコメントの提供が可能です。
+※NicoJK.iniのcommentShareMode、logfileMode、logfileDriversを調整してください。
+
 同梱のjkimlog.exeは外部のログファイルを"NicoJK"フォルダに取り込むコマンドライン
 ツールです。使用する場合はjkimlog.exeを"NicoJK"フォルダの直下に置いてください。
 ログファイル(.jklか.xmlか.txtで、ファイル名のどこかに"jk{番号}"を含むこと)のパス
@@ -30,6 +37,12 @@ NicoJK.tvtpおよびNicoJK.iniをTVTestのPluginフォルダに入れてくだ�
 > "Path\to\TVTest\Plugins\NicoJK\jkimlog.exe" %1
 > if %errorlevel% equ 0 del %1
 > pause
+
+同梱のjkrdlog.exeは実況番号やチャンネルと時間を指定してログを標準出力するコマン
+ドラインツールです。使用する場合はjkrdlog.exeを"NicoJK"フォルダの直下に置いてく
+ださい。出力の仕様については後述の開発者むけの説明も参照してください。
+等速でjk2の2023-01-01T00:00:00からのログを出力:
+> "Path\to\TVTest\Plugins\NicoJK\jkrdlog.exe" -r 100 jk2 1672498800 0
 
 ■設定
 NicoJK.iniを確認してください。
@@ -94,6 +107,37 @@ https://github.com/rutice/NicoJK/downloads
 ■ソースコード
 https://github.com/rutice/NicoJK
 ※このフォークのソースコードは https://github.com/xt4ubq/NicoJK
+
+■他プロセスとのコメント共用機能の仕様(開発者むけ)
+NicoJK.iniのcommentShareModeを1にすると受信中のchatタグを名前付きパイプ:
+"\\.\pipe\chat_d7b64ac2_{プロセスID}" から取得できる。さらに、commentShareModeを
+2にするとコメント投稿を名前付きパイプ:
+"\\.\pipe\post_d7b64ac2_{プロセスID}" に書き込める。
+"d7b64ac2"は名前の競合を防ぐための単なる定数。プロセスIDは対象の実況に紐づいた映
+像などを処理しているプロセスのプロセスIDなので、名前付きパイプを作成したプロセス
+とは異なるかもしれない。NicoJKではTVTestのコマンドラインオプションに
+  /jkshpid {プロセスID}
+と指定されていれば(映像のソースが他プロセスにあってBonDriver経由で視聴しているだ
+けの場合など)そのプロセスID、指定されていなければTVTest自体のプロセスIDを使う。
+
+["chat"パイプやjkrdlog.exeの出力の仕様]
+データの出力ごとに必ず80文字(バイト単位)の以下のようなヘッダがつく。
+  <!-- J={実況番号};[T={unix時間};]L={データ部分の文字数};N={データ部分の改行数}[改行含め80文字になるまで空白] -->{改行}
+改行はLFでもCRLFでもよいが文字数はどちらも1つと数える。jkrdlog.exeの出力では"T="
+もつく。
+データ部分はUTF-8のchatタグ等を改行で羅列したもの(「ログの仕様」と大体同じ)。任
+意に以下のようなメッセージが挿入される。
+  <!-- M={メッセージ} -->{改行}
+データ部分があるかないかに関わらずヘッダだけでも一定間隔(1秒ほど)で出力される。
+
+["post"パイプの仕様]
+以下のような文字列を書き込むとコメント投稿欄に入力したのと同様に扱われる。
+  [コマンド欄]コメント{改行...}
+コマンド欄は省略できないので中身がなければ"[]"とする。改行はLFでもCRLFでもよい。
+改行は終端を意味し冗長に書き込めるので、失敗する(切断)まで書き込み続けると確実。
+文字コードはUTF-8。コメントのRS(レコードセパレータ)文字は改行文字と解釈される。
+先頭文字が"["でない書き込みは無視される。投稿の成否などは"chat"パイプにメッセー
+ジやchat_resultタグを挿入して伝えられる。
 
 ■ログの仕様(開発者むけ)
 ルートフォルダに"jk{実況番号}"というフォルダ(jkフォルダ)を作成する。jkフォルダに
