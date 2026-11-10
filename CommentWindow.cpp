@@ -245,6 +245,7 @@ CCommentWindow::CCommentWindow()
 	, bShowOsd_(false)
 	, bUseTexture_(false)
 	, bUseDrawingThread_(false)
+	, bVideoOnly_(false)
 	, pTextureBitmap_(nullptr)
 	, pgTexture_(nullptr)
 	, currentTextureHeight_(0)
@@ -392,6 +393,18 @@ void CCommentWindow::SetCommentHighlight(bool commentHighligh)
 	hideCommentHighlight_ = commentHighligh;
 }
 
+// 黒帯を除いた映像表示範囲への追従設定
+void CCommentWindow::SetVideoOnly(bool bVideoOnly)
+{
+	lock_recursive_mutex lock(drawingLock_);
+	bVideoOnly_ = bVideoOnly;
+	if (hwnd_) {
+		if (bVideoOnly_ && !bUseOsd_) SetTimer(hwnd_, 2, 100, nullptr);
+		else KillTimer(hwnd_, 2);
+		OnParentSize();
+	}
+}
+
 // 作業用ビットマップを確保
 bool CCommentWindow::AllocateWorkBitmap(int width, int height, bool *pbRealloc)
 {
@@ -430,11 +443,31 @@ bool CCommentWindow::AllocateWorkBitmap(int width, int height, bool *pbRealloc)
 	return hbmWork_ != nullptr;
 }
 
+// 映像表示範囲のスクリーン座標への変換、取得失敗時の従来範囲への復帰
+bool CCommentWindow::GetParentDisplayRect(RECT *pRect) const
+{
+	RECT rc;
+	if (bVideoOnly_ && !bUseOsd_ && osdCompositor_.GetVideoDisplayRect(hwndParent_, &rc)) {
+		SetLastError(ERROR_SUCCESS);
+		if (MapWindowPoints(hwndParent_, nullptr, reinterpret_cast<POINT*>(&rc), 2) != 0 || GetLastError() == ERROR_SUCCESS) {
+			*pRect = rc;
+			return true;
+		}
+	}
+	return GetWindowRect(hwndParent_, pRect) != FALSE;
+}
+
 void CCommentWindow::OnParentMove()
 {
 	lock_recursive_mutex lock(drawingLock_);
 	if (hwnd_) {
-		GetWindowRect(hwndParent_, &rcParent_);
+		RECT rc;
+		if (!GetParentDisplayRect(&rc)) return;
+		if (rc.right - rc.left != rcParent_.right - rcParent_.left || rc.bottom - rc.top != rcParent_.bottom - rcParent_.top) {
+			OnParentSize();
+			return;
+		}
+		rcParent_ = rc;
 		SetWindowPos(hwnd_, nullptr, rcParent_.left, rcParent_.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 	}
 }
@@ -443,7 +476,7 @@ bool CCommentWindow::IsParentSized()
 {
 	if (hwnd_) {
 		RECT rc;
-		if (GetWindowRect(hwndParent_, &rc) && !EqualRect(&rc, &rcParent_)) {
+		if (GetParentDisplayRect(&rc) && !EqualRect(&rc, &rcParent_)) {
 			return true;
 		}
 		if (bUseOsd_ && bShowOsd_) {
@@ -461,7 +494,7 @@ void CCommentWindow::OnParentSize()
 	lock_recursive_mutex lock(drawingLock_);
 	bDrawingReady_ = false;
 	if (hwnd_) {
-		GetWindowRect(hwndParent_, &rcParent_);
+		if (!GetParentDisplayRect(&rcParent_)) return;
 		if (bUseOsd_ && bShowOsd_) {
 			osdCompositor_.DeleteTexture(0, 0);
 			bShowOsd_ = false;
@@ -1253,6 +1286,7 @@ LRESULT CALLBACK CCommentWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 		SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pThis));
 		pThis->hwnd_ = hwnd;
 		SetTimer(hwnd, 1, 1000, nullptr);
+		if (pThis->bVideoOnly_ && !pThis->bUseOsd_) SetTimer(hwnd, 2, 100, nullptr);
 		return 0;
 	case WM_DESTROY:
 	{
@@ -1264,6 +1298,13 @@ LRESULT CALLBACK CCommentWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 		return 0;
 	}
 	case WM_TIMER:
+		if (wParam == 2) {
+			pThis = reinterpret_cast<CCommentWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+			lock_recursive_mutex lock(pThis->drawingLock_);
+			// パネル開閉やアスペクト比変更による映像範囲の変化への追従
+			if (pThis->IsParentSized()) pThis->OnParentSize();
+			return 0;
+		}
 		if (wParam == 1) {
 			pThis = reinterpret_cast<CCommentWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 			lock_recursive_mutex drawingLock(pThis->drawingLock_);

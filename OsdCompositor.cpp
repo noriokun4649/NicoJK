@@ -38,6 +38,7 @@ COsdCompositor::COsdCompositor()
     , m_hOle32(nullptr)
     , m_pfnCoCreateInstance(nullptr)
     , m_pRenderer(nullptr)
+    , m_pVideoRenderer(nullptr)
     , m_RendererType(RT_VMR9)
     , m_hD3D9(nullptr)
     , m_pD3D9(nullptr)
@@ -159,6 +160,82 @@ bool COsdCompositor::GetSurfaceRect(RECT *pRect)
     return SendMessageToHandle(WM_GET_SURFACE_RECT, 0, reinterpret_cast<LPARAM>(pRect)) != FALSE;
 }
 
+// レンダラの表示先からコンテナ座標への変換と可視範囲への制限
+static bool MapVideoDisplayRect(HWND hwndVideo, HWND hwndContainer, RECT *pRect)
+{
+    RECT rcClient;
+    if (!hwndVideo || (hwndVideo != hwndContainer && !IsChild(hwndContainer, hwndVideo)) ||
+        !GetClientRect(hwndVideo, &rcClient) || !IntersectRect(pRect, pRect, &rcClient)) {
+        return false;
+    }
+    SetLastError(ERROR_SUCCESS);
+    return MapWindowPoints(hwndVideo, hwndContainer, reinterpret_cast<POINT*>(pRect), 2) != 0 || GetLastError() == ERROR_SUCCESS;
+}
+
+// OSD合成の有効状態に依存しない映像表示範囲の取得
+bool COsdCompositor::GetVideoDisplayRect(HWND hwndContainer, RECT *pRect) const
+{
+    if (!m_pVideoRenderer || !hwndContainer || !pRect) return false;
+    RECT rc = {};
+    bool found = false;
+    IMFGetService *pGetService;
+    if (SUCCEEDED(m_pVideoRenderer->QueryInterface(IID_PPV_ARGS(&pGetService)))) {
+        IMFVideoDisplayControl *pDisplay;
+        if (SUCCEEDED(pGetService->GetService(MR_VIDEO_RENDER_SERVICE, IID_PPV_ARGS(&pDisplay)))) {
+            MFVideoNormalizedRect rcSource;
+            HWND hwndVideo = nullptr;
+            found = SUCCEEDED(pDisplay->GetVideoPosition(&rcSource, &rc)) &&
+                    SUCCEEDED(pDisplay->GetVideoWindow(&hwndVideo)) &&
+                    MapVideoDisplayRect(hwndVideo, hwndContainer, &rc);
+            pDisplay->Release();
+        }
+        pGetService->Release();
+    }
+    if (!found) {
+        IVMRWindowlessControl9 *pControl;
+        if (SUCCEEDED(m_pVideoRenderer->QueryInterface(IID_PPV_ARGS(&pControl)))) {
+            found = SUCCEEDED(pControl->GetVideoPosition(nullptr, &rc));
+            pControl->Release();
+        }
+    }
+    if (!found) {
+        IVMRWindowlessControl *pControl;
+        if (SUCCEEDED(m_pVideoRenderer->QueryInterface(IID_PPV_ARGS(&pControl)))) {
+            found = SUCCEEDED(pControl->GetVideoPosition(nullptr, &rc));
+            pControl->Release();
+        }
+    }
+    if (!found) {
+        IBasicVideo *pVideo;
+        if (SUCCEEDED(m_pVideoRenderer->QueryInterface(IID_PPV_ARGS(&pVideo)))) {
+            IVideoWindow *pWindow;
+            if (SUCCEEDED(m_pVideoRenderer->QueryInterface(IID_PPV_ARGS(&pWindow)))) {
+                long left, top, width, height, style;
+                OAHWND owner = 0;
+                if (SUCCEEDED(pVideo->GetDestinationPosition(&rc.left, &rc.top, &rc.right, &rc.bottom)) &&
+                    rc.right > 0 && rc.bottom > 0 &&
+                    SUCCEEDED(pWindow->GetWindowPosition(&left, &top, &width, &height)) &&
+                    SUCCEEDED(pWindow->get_WindowStyle(&style)) && (style & WS_CHILD) &&
+                    SUCCEEDED(pWindow->get_Owner(&owner))) {
+                    rc.right += rc.left;
+                    rc.bottom += rc.top;
+                    RECT rcWindow = {0, 0, width, height};
+                    if (IntersectRect(&rc, &rc, &rcWindow)) {
+                        OffsetRect(&rc, left, top);
+                        found = MapVideoDisplayRect(reinterpret_cast<HWND>(owner), hwndContainer, &rc);
+                    }
+                }
+                pWindow->Release();
+            }
+            pVideo->Release();
+        }
+    }
+    RECT rcClient;
+    if (!found || !GetClientRect(hwndContainer, &rcClient) || !IntersectRect(&rc, &rc, &rcClient)) return false;
+    *pRect = rc;
+    return true;
+}
+
 // テクスチャを合成して描画領域を更新する
 // AddTexture()/DeleteTexture()が成功したら呼ぶ
 bool COsdCompositor::UpdateSurface()
@@ -262,6 +339,10 @@ void COsdCompositor::Uninitialize()
         m_pRenderer->Release();
         m_pRenderer = nullptr;
     }
+    if (m_pVideoRenderer) {
+        m_pVideoRenderer->Release();
+        m_pVideoRenderer = nullptr;
+    }
     if (m_hOle32) {
         ::FreeLibrary(m_hOle32);
         m_hOle32 = nullptr;
@@ -275,20 +356,35 @@ void COsdCompositor::Uninitialize()
 
 void COsdCompositor::OnFilterGraphInitialized(IGraphBuilder *pGraphBuilder)
 {
-    if (m_hwnd && !m_pfnCoCreateInstance) {
+    if (m_pVideoRenderer) {
+        m_pVideoRenderer->Release();
+        m_pVideoRenderer = nullptr;
+    }
+    if (pGraphBuilder) {
         IEnumFilters *pEnum = nullptr;
         HRESULT hr = pGraphBuilder->EnumFilters(&pEnum);
         if (SUCCEEDED(hr)) {
             IBaseFilter *pFilter;
             while (pEnum->Next(1, &pFilter, nullptr) == S_OK) {
-                CLSID clsid;
+                CLSID clsid = {};
                 if (SUCCEEDED(pFilter->GetClassID(&clsid))) {
-                    if (IsEqualCLSID(CLSID_VideoMixingRenderer9, clsid)) {
+                    if (!m_pVideoRenderer) {
+                        IBasicVideo *pVideo = nullptr;
+                        if (IsEqualCLSID(CLSID_VideoMixingRenderer9, clsid) ||
+                            IsEqualCLSID(CLSID_VideoMixingRenderer, clsid) ||
+                            IsEqualCLSID(CLSID_EnhancedVideoRenderer, clsid) ||
+                            SUCCEEDED(pFilter->QueryInterface(IID_PPV_ARGS(&pVideo)))) {
+                            m_pVideoRenderer = pFilter;
+                            m_pVideoRenderer->AddRef();
+                        }
+                        if (pVideo) pVideo->Release();
+                    }
+                    if (m_hwnd && !m_pfnCoCreateInstance && IsEqualCLSID(CLSID_VideoMixingRenderer9, clsid)) {
                         m_pRenderer = pFilter;
                         m_RendererType = RT_VMR9;
                         break;
                     }
-                    else if (IsEqualCLSID(CLSID_EnhancedVideoRenderer, clsid)) {
+                    else if (m_hwnd && !m_pfnCoCreateInstance && IsEqualCLSID(CLSID_EnhancedVideoRenderer, clsid)) {
                         m_pRenderer = pFilter;
                         m_RendererType = RT_EVR;
                         break;
@@ -304,6 +400,10 @@ void COsdCompositor::OnFilterGraphInitialized(IGraphBuilder *pGraphBuilder)
 void COsdCompositor::OnFilterGraphFinalize(IGraphBuilder *pGraphBuilder)
 {
     static_cast<void>(pGraphBuilder);
+    if (m_pVideoRenderer) {
+        m_pVideoRenderer->Release();
+        m_pVideoRenderer = nullptr;
+    }
     if (m_hwnd && !m_pfnCoCreateInstance) {
         if (m_pRenderer) {
             m_pRenderer->Release();

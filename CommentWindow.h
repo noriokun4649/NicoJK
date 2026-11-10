@@ -51,6 +51,7 @@ public:
 	BYTE GetOpacity() const { return opacity_; }
 	void SetOpacity(BYTE opacity);
 	void SetCommentHighlight(bool commentHighligh);
+	void SetVideoOnly(bool bVideoOnly);
 	void SetDebugFlags(int debugFlags);
 	void OnParentMove();
 	void OnParentSize();
@@ -126,6 +127,7 @@ private:
 		}
 	};
 	bool AllocateWorkBitmap(int width, int height, bool *pbRealloc);
+	bool GetParentDisplayRect(RECT *pRect) const;
 	bool IsParentSized();
 	void UpdateLayeredWindow();
 	void Present(SIZE *size = nullptr);
@@ -181,6 +183,7 @@ private:
 	bool bShowOsd_;
 	bool bUseTexture_;
 	bool bUseDrawingThread_;
+	bool bVideoOnly_;
 	Gdiplus::Bitmap *pTextureBitmap_;
 	Gdiplus::Graphics *pgTexture_;
 	int currentTextureHeight_;
