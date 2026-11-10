@@ -1,8 +1,13 @@
 ﻿struct JKID_NAME_ELEM {
-	int jkID;
+	int first; // jkID
 	LPCTSTR name;
 	const char *chatStreamID;
 };
+
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
 
 static const JKID_NAME_ELEM DEFAULT_JKID_NAME_TABLE[] = {
 	// ニコニコ実況チャンネルリスト(jkch.sh.txtより)(jkIDでソート必須)
@@ -17,7 +22,9 @@ static const JKID_NAME_ELEM DEFAULT_JKID_NAME_TABLE[] = {
 	{  10, TEXT("テレ玉") },
 	{  11, TEXT("tvk") },
 	{  12, TEXT("チバテレ") },
-	{ 101, TEXT("NHK BS1"), "ch2647992" },
+	{  13, TEXT("サンテレビ") },
+	{  14, TEXT("KBS京都") },
+	{ 101, TEXT("NHK BS"), "ch2647992" },
 	{ 103, TEXT("NHK BSプレミアム") },
 	{ 141, TEXT("BS日テレ") },
 	{ 151, TEXT("BS朝日") },
@@ -27,8 +34,8 @@ static const JKID_NAME_ELEM DEFAULT_JKID_NAME_TABLE[] = {
 	{ 191, TEXT("WOWOWプライム") },
 	{ 192, TEXT("WOWOWライブ") },
 	{ 193, TEXT("WOWOWシネマ") },
-	{ 200, TEXT("スターチャンネル1") },
-	{ 201, TEXT("スターチャンネル2") },
+	{ 200, TEXT("BS10") },
+	{ 201, TEXT("BS10スターチャンネル") },
 	{ 202, TEXT("スターチャンネル3") },
 	{ 211, TEXT("BS11イレブン"), "ch2646846" },
 	{ 222, TEXT("BS12トゥエルビ") },
@@ -52,3 +59,7 @@ static const JKID_NAME_ELEM DEFAULT_JKID_NAME_TABLE[] = {
 	{ 333, TEXT("AT-X") },
 	{ 910, TEXT("SOLiVE24") },
 };
+
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#endif

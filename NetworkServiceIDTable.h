@@ -1,8 +1,8 @@
 ﻿struct NETWORK_SERVICE_ID_ELEM {
 	// 優先度の高い対応であることを表すjkIDのマスク
 	static const int JKID_PRIOR = 0x40000000;
-	// ネットワークID(下位16bit、ただし地上波は0x000F)とサービスID(上位16bit)とをパックした値、0は無効値を表す
-	DWORD ntsID;
+	// ntsID:ネットワークID(下位16bit、ただし地上波は0x000F)とサービスID(上位16bit)とをパックした値、0は無効値を表す
+	DWORD first;
 	// ntsIDに対応する実況ID、負値は対応無しを表す
 	int jkID;
 };
@@ -222,7 +222,9 @@ static const NETWORK_SERVICE_ID_ELEM DEFAULT_NTSID_TABLE[] = {
 	{0xA000000F,   1},
 	{0xA030000F,   7},
 	{0xA400000F,   1},
+	{0xA430000F,  14},
 	{0xA800000F,   1},
+	{0xA830000F,  13},
 	{0xAC00000F,   1},
 	{0xB000000F,   1},
 	{0xB400000F,   1},
