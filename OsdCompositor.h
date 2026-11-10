@@ -21,6 +21,7 @@ public:
     bool DeleteTexture(int ID, int Group);
     bool ShowTexture(bool fShow, int ID, int Group);
     bool GetSurfaceRect(RECT *pRect);
+    bool GetVideoDisplayRect(HWND hwndContainer, RECT *pRect) const;
     bool UpdateSurface();
 #if OSD_COMPOSITOR_VERSION >= 1
     typedef BOOL (CALLBACK *UpdateCallbackFunc)(void *pBits, const RECT *pSurfaceRect, int Pitch, void *pClientData);
@@ -77,6 +78,7 @@ private:
     HMODULE m_hOle32;
     CoCreateInstanceFunc *m_pfnCoCreateInstance;
     IBaseFilter *m_pRenderer;
+    IBaseFilter *m_pVideoRenderer;
     RENDERER_TYPE m_RendererType;
     HMODULE m_hD3D9;
     IDirect3D9 *m_pD3D9;
