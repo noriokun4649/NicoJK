@@ -166,6 +166,18 @@ void DecodeEntityReference(TCHAR *str)
 	*p = TEXT('\0');
 }
 
+std::string TStringToPrintableAsciiString(LPCTSTR str)
+{
+	// ASCII印字可能文字だけ抽出。空白を含まないことに注意
+	std::string ret;
+	for (size_t i = 0; str[i]; ++i) {
+		if (TEXT('!') <= str[i] && str[i] <= TEXT('~')) {
+			ret += static_cast<char>(str[i]);
+		}
+	}
+	return ret;
+}
+
 COLORREF GetColor(const char *command)
 {
 	static const std::regex re("(?:^| )#([0-9A-Fa-f]{6})(?: |$)");
@@ -379,9 +391,6 @@ std::string UnprotectV10ToString(const char *src, const char *v10Key, char *buf,
 // コマンドを実行してCookieを得る
 std::string GetCookieString(LPCTSTR execGetCookie, LPCTSTR execGetV10Key, char *buf, size_t bufSize, int timeout)
 {
-	if (!_tcsicmp(execGetCookie, TEXT("cmd /c echo ;"))) {
-		return ";";
-	}
 	TCHAR currDir[MAX_PATH];
 	if (GetLongModuleFileName(nullptr, currDir, _countof(currDir))) {
 		for (size_t i = _tcslen(currDir); i > 0 && !_tcschr(TEXT("/\\"), currDir[i - 1]); ) {

@@ -17,6 +17,8 @@ public:
 	static const int UPDATE_FORCE_INTERVAL = 20000;
 	// コメントサーバ切断をチェックして再接続する間隔(あんまり短くしちゃダメ!)
 	static const int JK_WATCHDOG_INTERVAL = 20000;
+	// チャンネル変更などでコメントサーバ切断してから再接続するまでの猶予
+	static const int JK_WATCHDOG_RECONNEC_DELAY = 3000;
 	// ログファイルフォルダの更新をチェックする間隔
 	static const int READ_LOG_FOLDER_INTERVAL = 3000;
 	// チャンネル変更などの後に適当な実況IDのチェックを行うまでの猶予
@@ -58,6 +60,18 @@ private:
 		tstring execGetCookie;
 		tstring execGetV10Key;
 		std::string channelsUri;
+		std::string refugeUri;
+		bool bDropForwardedComment;
+		bool bRefugeMixing;
+		bool bPostToRefuge;
+		COLORREF crNicoEditBox;
+		COLORREF crRefugeEditBox;
+		COLORREF crNicoMarker;
+		COLORREF crRefugeMarker;
+		COLORREF crNicoLightShadow;
+		COLORREF crRefugeLightShadow;
+		COLORREF crNicoDarkShadow;
+		COLORREF crRefugeDarkShadow;
 		tstring mailDecorations;
 		bool bAnonymity;
 		bool bUseOsdCompositor;
@@ -77,14 +91,23 @@ private:
 		bool bUsePanel;
 	};
 	struct FORCE_ELEM {
-		int jkID;
+		int first; // jkID
 		int force;
 		bool bFixedName;
 		tstring name;
 		std::string chatStreamID;
+		std::string refugeChatStreamID;
+	};
+	enum LOG_ELEM_TYPE {
+		LOG_ELEM_TYPE_DEFAULT,
+		LOG_ELEM_TYPE_HIDE,
+		LOG_ELEM_TYPE_REFUGE,
+		LOG_ELEM_TYPE_REFUGE_HIDE,
+		LOG_ELEM_TYPE_MESSAGE,
 	};
 	struct LOG_ELEM {
 		SYSTEMTIME st;
+		LOG_ELEM_TYPE type;
 		int no;
 		COLORREF cr;
 		TCHAR marker[28];
@@ -101,14 +124,18 @@ private:
 		void SetEnabled(bool b);
 		bool SetPattern(LPCTSTR patt);
 	};
+	struct LOGFILE_CONTEXT {
+		int jkID;
+		DWORD tick;
+		HANDLE hFile;
+		HANDLE hLockfile;
+		std::string buf;
+	};
 	bool TogglePlugin(bool bEnabled);
+	void TogglePanelPopup();
 	void ToggleStreamCallback(bool bSet);
 	void SyncThread();
 	void CheckRecordingThread(DWORD processID);
-	static std::vector<NETWORK_SERVICE_ID_ELEM>::iterator LowerBoundNetworkServiceID(std::vector<NETWORK_SERVICE_ID_ELEM>::iterator first,
-	                                                                                 std::vector<NETWORK_SERVICE_ID_ELEM>::iterator last, DWORD ntsID);
-	static std::vector<FORCE_ELEM>::iterator LowerBoundJKID(std::vector<FORCE_ELEM>::iterator first,
-	                                                        std::vector<FORCE_ELEM>::iterator last, int jkID);
 	void LoadFromIni();
 	void SaveToIni();
 	void LoadForceListFromIni(const tstring &logfileFolder);
@@ -120,17 +147,21 @@ private:
 	bool GetChannelNetworkServiceID(int tuningSpace, int channelIndex, DWORD *pNtsID);
 	LONGLONG GetCurrentTot();
 	bool IsMatchDriverName(LPCTSTR drivers);
-	void WriteToLogfile(int jkID, const char *text = nullptr);
+	void WriteToLogfile(LOGFILE_CONTEXT &ctx, int jkID, const char *text = nullptr);
 	bool ReadFromLogfile(int jkID, const char **text = nullptr, unsigned int tmToRead = 0);
 	static LRESULT CALLBACK EventCallback(UINT Event, LPARAM lParam1, LPARAM lParam2, void *pClientData);
 	static BOOL CALLBACK WindowMsgCallback(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam, LRESULT *pResult, void *pUserData);
-	bool ProcessChatTag(const char *tag, bool bShow = true, int showDelay = 0);
+	bool ProcessChatTag(const char *tag, bool bShow = true, int showDelay = 0, bool *pbRefuge = nullptr);
 	void OutputMessageLog(LPCTSTR text);
 	void GetPostComboBoxText(LPTSTR comm, size_t commSize, LPTSTR mail = nullptr, size_t mailSize = 0);
 	void ProcessLocalPost(LPCTSTR comm);
+	void RestorePopupWindowOpacity(HWND hwnd);
+	void RestorePopupWindowState(HWND hwnd);
 	static LRESULT CALLBACK PanelWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+	static LRESULT CALLBACK PanelPopupWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 	static LRESULT CALLBACK ForceWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 	bool CreateForceWindowItems(HWND hwnd);
+	void SetOpacity(HWND hwnd, int opacityOrToggle);
 	LRESULT ForceWindowProcMain(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 	static BOOL CALLBACK StreamCallback(BYTE *pData, void *pClientData);
 
@@ -144,7 +175,10 @@ private:
 
 	// 勢い窓
 	HWND hPanel_;
+	HWND hPanelPopup_;
 	HWND hForce_;
+	HWND hForcePostEditBox_;
+	HBRUSH hbrForcePostEditBox_;
 	HFONT hForceFont_;
 	bool bDisplayLogList_;
 	std::vector<FORCE_ELEM> forceList_;
@@ -152,8 +186,10 @@ private:
 	size_t logListDisplayedSize_;
 	bool bPendingTimerUpdateList_;
 	DWORD lastUpdateListTick_;
-	tstring lastCalcText_;
-	int lastCalcWidth_;
+	tstring lastCalcLeftText_;
+	tstring lastCalcMiddleText_;
+	int lastCalcLeftWidth_;
+	int lastCalcMiddleWidth_;
 
 	// コメント描画ウィンドウ
 	CCommentWindow commentWindow_;
@@ -179,17 +215,19 @@ private:
 	DWORD currentJKForceByChatCountTick_;
 	DWORD lastPostTick_;
 	TCHAR lastPostComm_[POST_COMMENT_MAX];
+	bool bPostToRefuge_;
+	bool bPostToRefugeInverted_;
 
 	// 過去ログ関係
 	std::atomic_bool bRecording_;
 	std::thread checkRecordingThread_;
-	HANDLE hQuitCheckRecordingEvent_;
+	CAutoResetEvent quitCheckRecordingEvent_;
 	bool bUsingLogfileDriver_;
 	bool bSetStreamCallback_;
 	bool bResyncComment_;
-	int currentLogfileJK_;
-	HANDLE hLogfile_;
-	HANDLE hLogfileLock_;
+	bool bNicoReceivingPastChat_;
+	bool bRefugeReceivingPastChat_;
+	LOGFILE_CONTEXT logfileCtx_;
 	CLogReader logReader_;
 	LONGLONG llftTot_;
 	LONGLONG llftTotLast_;
@@ -203,7 +241,7 @@ private:
 	int pcrPid_;
 	int pcrPids_[8];
 	int pcrPidCounts_[8];
-	recursive_mutex_ streamLock_;
+	std::recursive_mutex streamLock_;
 
 	// 指定ファイル再生
 	bool bSpecFile_;

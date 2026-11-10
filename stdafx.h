@@ -5,20 +5,11 @@
 
 #pragma once
 
-#ifndef WINVER
-#define WINVER 0x0501		// Windows XP
-#endif
+#define _WIN32_WINNT _WIN32_WINNT_VISTA
 
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0501	// Windows XP
-#endif
+#include <sdkddkver.h>
 
-#ifndef _WIN32_IE
-#define _WIN32_IE 0x0600	// Internet Explorer 6.0
-#endif
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "Common.h"
 #include <WindowsX.h>
 #include <objbase.h>
 #include <vector>
@@ -27,7 +18,6 @@
 #include <memory>
 #include <utility>
 #include <algorithm>
-#include <tchar.h>
 
 #pragma comment(lib, "winmm.lib")
 
@@ -36,5 +26,3 @@
 #undef max
 using std::min;
 using std::max;
-
-typedef std::basic_string<TCHAR> tstring;

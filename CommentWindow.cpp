@@ -197,14 +197,6 @@ bool CCommentWindow::Initialize(HINSTANCE hinst, bool *pbEnableOsdCompositor, bo
 			osdCompositor_.SetUpdateCallback(UpdateCallback, this);
 		}
 
-		OSVERSIONINFOEX vi;
-		vi.dwOSVersionInfoSize = sizeof(vi);
-		vi.dwMajorVersion = 6;
-		if (VerifyVersionInfo(&vi, VER_MAJORVERSION, VerSetConditionMask(0, VER_MAJORVERSION, VER_GREATER_EQUAL))) {
-			// このAPIはVista以降に存在するがVistaの実装はバグを含むらしい(KB955688)ので注意
-			pfnUpdateLayeredWindowIndirect_ = reinterpret_cast<BOOL (WINAPI*)(HWND, const UPDATELAYEREDWINDOWINFO*)>(
-				GetProcAddress(GetModuleHandle(TEXT("user32.dll")), "UpdateLayeredWindowIndirect"));
-		}
 		bSse2Available_ = IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE) != FALSE;
 	}
 	return true;
@@ -212,7 +204,6 @@ bool CCommentWindow::Initialize(HINSTANCE hinst, bool *pbEnableOsdCompositor, bo
 
 void CCommentWindow::Finalize()
 {
-	pfnUpdateLayeredWindowIndirect_ = nullptr;
 	if (hinst_) {
         osdCompositor_.Uninitialize();
 		Gdiplus::GdiplusShutdown(gdiplusToken_);
@@ -224,14 +215,12 @@ void CCommentWindow::Finalize()
 CCommentWindow::CCommentWindow()
 	: hinst_(nullptr)
 	, gdiplusToken_(0)
-	, pfnUpdateLayeredWindowIndirect_(nullptr)
 	, bSse2Available_(false)
 	, hwnd_(nullptr)
 	, hwndParent_(nullptr)
 	, hbmWork_(nullptr)
 	, pBits_(nullptr)
 	, hdcWork_(nullptr)
-	, hDrawingEvent_(nullptr)
 	, hDrawingIdleEvent_(nullptr)
 	, bQuitDrawingThread_(false)
 	, commentSizeMin_(1)
@@ -286,9 +275,9 @@ bool CCommentWindow::Create(HWND hwndParent)
 		               TEXT("ru.jk.comment"), nullptr, WS_POPUP, 0, 0, 0, 0, hwndParent_, nullptr, hinst_, this);
 		if (hwnd_) {
 			if (!bUseOsd_ && bUseDrawingThread_) {
-				hDrawingEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+				drawingEvent_.Reset();
 				hDrawingIdleEvent_ = CreateEvent(nullptr, TRUE, TRUE, nullptr);
-				if (hDrawingEvent_ && hDrawingIdleEvent_) {
+				if (hDrawingIdleEvent_) {
 					bQuitDrawingThread_ = false;
 					drawingThread_ = std::thread([this](){ DrawingThread(); });
 					SetThreadPriority(drawingThread_.native_handle(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -309,16 +298,12 @@ void CCommentWindow::Destroy()
 {
 	if (drawingThread_.joinable()) {
 		bQuitDrawingThread_ = true;
-		SetEvent(hDrawingEvent_);
+		drawingEvent_.Set();
 		drawingThread_.join();
 	}
 	if (hDrawingIdleEvent_) {
 		CloseHandle(hDrawingIdleEvent_);
 		hDrawingIdleEvent_ = nullptr;
-	}
-	if (hDrawingEvent_) {
-		CloseHandle(hDrawingEvent_);
-		hDrawingEvent_ = nullptr;
 	}
 	if (hwnd_) {
 		DestroyWindow(hwnd_);
@@ -503,9 +488,17 @@ void CCommentWindow::OnParentSize()
 	}
 }
 
-// コメントを1つだけ追加する
+// 従来の影色選択と自コメント強調指定の互換処理
 void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION position,
                              CHAT_SIZE size, bool bSelfComment, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay)
+{
+	COLORREF shadowColor = 3 * GetRValue(color) + 6 * GetGValue(color) + GetBValue(color) < 255 ? RGB(255, 255, 255) : RGB(0, 0, 0);
+	AddChat(text, color, shadowColor, position, size, align, bInsertLast, backOpacity, delay, bSelfComment);
+}
+
+// コメントの追加
+void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, COLORREF shadowColor, CHAT_POSITION position,
+                             CHAT_SIZE size, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay, bool bSelfComment)
 {
 	if (hwnd_) {
 		std::list<CHAT> lc(1);
@@ -517,6 +510,9 @@ void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION positio
 		c.colorG = GetGValue(color);
 		c.colorR = GetRValue(color);
 		c.colorA = bAntiAlias_ ? backOpacity : backOpacity ? 255 : 0;
+		c.shadowColorB = GetBValue(shadowColor);
+		c.shadowColorG = GetGValue(shadowColor);
+		c.shadowColorR = GetRValue(shadowColor);
 		c.position = position;
 		c.bSmall = size != CHAT_SIZE_DEFAULT;
 		c.alignFactor = position==CHAT_POS_DEFAULT || align==CHAT_ALIGN_LEFT ? 0 : align==CHAT_ALIGN_RIGHT ? 2 : 1;
@@ -662,7 +658,21 @@ void CCommentWindow::UpdateLayeredWindow()
 	BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
 	// ダーティ領域を指示すると閑散とした実況で実測25%強軽い
 	HDC hdc = GetDC(hwnd_);
-	UpdateLayeredWindow(hwnd_, hdc, nullptr, &sz, hdcWork_, &ptSrc, RGB(12, 12, 12), &blend, bAntiAlias_ ? ULW_ALPHA : ULW_COLORKEY, &rcDirty_);
+
+	UPDATELAYEREDWINDOWINFO info;
+	info.cbSize = sizeof(info);
+	info.hdcDst = hdc;
+	info.pptDst = nullptr;
+	info.psize = &sz;
+	info.hdcSrc = hdcWork_;
+	info.pptSrc = &ptSrc;
+	info.crKey = RGB(12, 12, 12);
+	info.pblend = &blend;
+	info.dwFlags = bAntiAlias_ ? ULW_ALPHA : ULW_COLORKEY;
+	info.prcDirty = &rcDirty_;
+	// このAPIはVista以降に存在するがVistaの実装はバグを含むらしい(KB955688)ので注意
+	::UpdateLayeredWindowIndirect(hwnd_, &info);
+
 	ReleaseDC(hwnd_, hdc);
 	SelectObject(hdcWork_, hbmOld);
 
@@ -670,7 +680,7 @@ void CCommentWindow::UpdateLayeredWindow()
 		// あとはスレッドに任せる
 		// 目的は高速化ではなくメインスレッドの拘束時間を減らすこと
 		ResetEvent(hDrawingIdleEvent_);
-		SetEvent(hDrawingEvent_);
+		drawingEvent_.Set();
 	} else {
 		UpdateChat();
 	}
@@ -679,7 +689,7 @@ void CCommentWindow::UpdateLayeredWindow()
 // 描画スレッド
 void CCommentWindow::DrawingThread()
 {
-	while (WaitForSingleObject(hDrawingEvent_, INFINITE) == WAIT_OBJECT_0 && !bQuitDrawingThread_) {
+	while (drawingEvent_.WaitOne() && !bQuitDrawingThread_) {
 		UpdateChat();
 		// これがシグナル状態のとき描画スレッドはメンバ変数にアクセスしてはいけない
 		SetEvent(hDrawingIdleEvent_);
@@ -743,27 +753,6 @@ void CCommentWindow::UpdateChat()
 	}
 }
 
-BOOL CCommentWindow::UpdateLayeredWindow(HWND hWnd, HDC hdcDst, POINT *pptDst, SIZE *psize, HDC hdcSrc, POINT *pptSrc,
-                                         COLORREF crKey, BLENDFUNCTION *pblend, DWORD dwFlags, RECT *prcDirty)
-{
-	if (pfnUpdateLayeredWindowIndirect_) {
-		UPDATELAYEREDWINDOWINFO info;
-		info.cbSize = sizeof(info);
-		info.hdcDst = hdcDst;
-		info.pptDst = pptDst;
-		info.psize = psize;
-		info.hdcSrc = hdcSrc;
-		info.pptSrc = pptSrc;
-		info.crKey = crKey;
-		info.pblend = pblend;
-		info.dwFlags = dwFlags;
-		info.prcDirty = prcDirty;
-		return pfnUpdateLayeredWindowIndirect_(hWnd, &info);
-	} else {
-		return ::UpdateLayeredWindow(hWnd, hdcDst, pptDst, psize, hdcSrc, pptSrc, crKey, pblend, dwFlags & ~ULW_EX_NORESIZE);
-	}
-}
-
 // サーフェイス合成時のコールバック
 // COsdCompositor::UpdateSurface()から呼ばれるので必ずメインスレッド
 BOOL CALLBACK CCommentWindow::UpdateCallback(void *pBits, const RECT *pSurfaceRect, int pitch, void *pClientData)
@@ -821,14 +810,16 @@ void CCommentWindow::DrawChat(Gdiplus::Graphics &g, int width, int height, RECT 
 		Gdiplus::REAL fontEm = static_cast<Gdiplus::REAL>(fontScale_ * height / actLineCount);
 		Gdiplus::REAL fontEmSmall = static_cast<Gdiplus::REAL>(fontSmallScale_ * height / actLineCount);
 		int fontStyle = fontStyle_;
-		Gdiplus::Font font(fontName_, fontEm * 0.75f, fontStyle);
-		Gdiplus::Font fontSmall(fontName_, fontEmSmall * 0.75f, fontStyle);
+		// 高DPI時の影響を打ち消すため
+		Gdiplus::REAL emPointsRatio = 72 / g.GetDpiY();
+		Gdiplus::Font font(fontName_, fontEm * emPointsRatio, fontStyle);
+		Gdiplus::Font fontSmall(fontName_, fontEmSmall * emPointsRatio, fontStyle);
 		// 複数行用フォント
-		Gdiplus::Font tmpFontMulti(fontNameMulti_, fontEm * 0.75f, fontStyle);
-		Gdiplus::Font tmpFontMultiSmall(fontNameMulti_, fontEmSmall * 0.75f, fontStyle);
+		Gdiplus::Font tmpFontMulti(fontNameMulti_, fontEm * emPointsRatio, fontStyle);
+		Gdiplus::Font tmpFontMultiSmall(fontNameMulti_, fontEmSmall * emPointsRatio, fontStyle);
 		// 絵文字用フォント
-		Gdiplus::Font tmpFontEmoji(fontNameEmoji_[0] ? fontNameEmoji_ : fontName_, fontEm * 0.75f, fontStyle);
-		Gdiplus::Font tmpFontEmojiSmall(fontNameEmoji_[0] ? fontNameEmoji_ : fontName_, fontEmSmall * 0.75f, fontStyle);
+		Gdiplus::Font tmpFontEmoji(fontNameEmoji_[0] ? fontNameEmoji_ : fontName_, fontEm * emPointsRatio, fontStyle);
+		Gdiplus::Font tmpFontEmojiSmall(fontNameEmoji_[0] ? fontNameEmoji_ : fontName_, fontEmSmall * emPointsRatio, fontStyle);
 
 		// 可能なら同じオブジェクトを参照しておく(いいことあるかもしれないので)
 		bool bSameMulti = !_tcscmp(fontName_, fontNameMulti_);
@@ -995,7 +986,7 @@ void CCommentWindow::DrawChat(Gdiplus::Graphics &g, int width, int height, RECT 
 			}
 			Gdiplus::ARGB color = Gdiplus::Color::MakeARGB(it->colorA, it->colorR, it->colorG, it->colorB);
 			Gdiplus::Color foreColor(color | Gdiplus::Color::AlphaMask);
-			Gdiplus::Color shadowColor(3*foreColor.GetR() + 6*foreColor.GetG() + foreColor.GetB() < 255 ? Gdiplus::Color::White : Gdiplus::Color::Black);
+			Gdiplus::Color shadowColor(it->shadowColorR, it->shadowColorG, it->shadowColorB);
 			Gdiplus::Color backColor1(Gdiplus::Color(color).GetA(), shadowColor.GetR(), shadowColor.GetG(), shadowColor.GetB());
 			Gdiplus::Color backColor2(bAntiAlias_ ? color : backColor1.GetValue());
 			bool bOpaque = backColor1.GetA() != 0;
@@ -1052,12 +1043,7 @@ void CCommentWindow::DrawChat(Gdiplus::Graphics &g, int width, int height, RECT 
 					// テクスチャが見つからなかったので作る
 					TEXTURE t;
 					SetRect(&t.rc, minPos.x, minPos.y, minPos.x + entireDrawWith, minPos.y + entireDrawHeight);
-					t.colorB = it->colorB;
-					t.colorG = it->colorG;
-					t.colorR = it->colorR;
-					t.colorA = it->colorA;
-					t.bSmall = it->bSmall;
-					t.text = it->text;
+					t.AssignAttributes(*it);
 					pgTexture_->SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
 					pgTexture_->SetSmoothingMode(Gdiplus::SmoothingModeNone);
 					if (bOpaque) {

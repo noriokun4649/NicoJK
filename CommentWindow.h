@@ -56,6 +56,8 @@ public:
 	void OnParentSize();
 	void AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION position, CHAT_SIZE size = CHAT_SIZE_DEFAULT, bool bSelfComment = false,
 	             CHAT_ALIGN align = CHAT_ALIGN_CENTER, bool bInsertLast = false, BYTE backOpacity = 0, int delay = 0);
+	void AddChat(LPCTSTR text, COLORREF color, COLORREF shadowColor, CHAT_POSITION position, CHAT_SIZE size = CHAT_SIZE_DEFAULT,
+	             CHAT_ALIGN align = CHAT_ALIGN_CENTER, bool bInsertLast = false, BYTE backOpacity = 0, int delay = 0, bool bSelfComment = false);
 	void ScatterLatestChats(int duration);
 	void ClearChat();
 	void Forward(int duration);
@@ -72,6 +74,9 @@ private:
 		BYTE colorG;
 		BYTE colorR;
 		BYTE colorA;
+		BYTE shadowColorB;
+		BYTE shadowColorG;
+		BYTE shadowColorR;
 		CHAT_POSITION position;
 		bool bSmall;
 		BYTE alignFactor;
@@ -91,14 +96,31 @@ private:
 		BYTE colorG;
 		BYTE colorR;
 		BYTE colorA;
+		BYTE shadowColorB;
+		BYTE shadowColorG;
+		BYTE shadowColorR;
 		tstring text;
 		bool IsMatch(const CHAT &c) const {
 			return c.colorB == colorB &&
 			       c.colorG == colorG &&
 			       c.colorR == colorR &&
 			       c.colorA == colorA &&
+			       c.shadowColorB == shadowColorB &&
+			       c.shadowColorG == shadowColorG &&
+			       c.shadowColorR == shadowColorR &&
 			       c.bSmall == bSmall &&
 			       c.text == text;
+		}
+		void AssignAttributes(const CHAT &c) {
+			colorB = c.colorB;
+			colorG = c.colorG;
+			colorR = c.colorR;
+			colorA = c.colorA;
+			shadowColorB = c.shadowColorB;
+			shadowColorG = c.shadowColorG;
+			shadowColorR = c.shadowColorR;
+			bSmall = c.bSmall;
+			text = c.text;
 		}
 	};
 	bool AllocateWorkBitmap(int width, int height, bool *pbRealloc);
@@ -107,15 +129,12 @@ private:
 	void DrawingThread();
 	bool WaitForIdleDrawingThread();
 	void UpdateChat();
-	BOOL UpdateLayeredWindow(HWND hWnd, HDC hdcDst, POINT *pptDst, SIZE *psize, HDC hdcSrc, POINT *pptSrc,
-	                         COLORREF crKey, BLENDFUNCTION *pblend, DWORD dwFlags, RECT *prcDirty);
 	static BOOL CALLBACK UpdateCallback(void *pBits, const RECT *pSurfaceRect, int pitch, void *pClientData);
 	void DrawChat(Gdiplus::Graphics &g, int width, int height, RECT *prcUnused, RECT *prcUnusedWoShita, bool *pbHasFirstDrawShita);
 	static LRESULT CALLBACK WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 	HINSTANCE hinst_;
 	ULONG_PTR gdiplusToken_;
-	BOOL (WINAPI *pfnUpdateLayeredWindowIndirect_)(HWND hWnd, const UPDATELAYEREDWINDOWINFO *pULWInfo);
 	bool bSse2Available_;
 	HWND hwnd_;
 	HWND hwndParent_;
@@ -123,7 +142,7 @@ private:
 	void *pBits_;
 	HDC hdcWork_;
 	std::thread drawingThread_;
-	HANDLE hDrawingEvent_;
+	CAutoResetEvent drawingEvent_;
 	HANDLE hDrawingIdleEvent_;
 	std::atomic_bool bQuitDrawingThread_;
 	int commentSizeMin_;
@@ -146,7 +165,7 @@ private:
 	std::list<CHAT> chatList_;
 	std::list<CHAT> chatPoolList_;
 	// chatList_(リスト構造のみ),chatPoolList_を保護
-	recursive_mutex_ chatLock_;
+	std::recursive_mutex chatLock_;
 	int autoHideCount_;
 	int parentSizedCount_;
 	RECT rcParent_;
