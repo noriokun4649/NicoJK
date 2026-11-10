@@ -60,8 +60,10 @@ public:
 	             CHAT_ALIGN align = CHAT_ALIGN_CENTER, bool bInsertLast = false, BYTE backOpacity = 0, int delay = 0, bool bSelfComment = false);
 	void ScatterLatestChats(int duration);
 	void ClearChat();
+	void Forward();
 	void Forward(int duration);
 	void Update();
+	void UpdateAsync();
 	bool IsCreated() const { return hwnd_ != nullptr; }
 	void OnFilterGraphInitialized(IGraphBuilder *pGraphBuilder) { osdCompositor_.OnFilterGraphInitialized(pGraphBuilder); }
 	void OnFilterGraphFinalize(IGraphBuilder *pGraphBuilder) { osdCompositor_.OnFilterGraphFinalize(pGraphBuilder); }
@@ -126,8 +128,8 @@ private:
 	bool AllocateWorkBitmap(int width, int height, bool *pbRealloc);
 	bool IsParentSized();
 	void UpdateLayeredWindow();
+	void Present(SIZE *size = nullptr);
 	void DrawingThread();
-	bool WaitForIdleDrawingThread();
 	void UpdateChat();
 	static BOOL CALLBACK UpdateCallback(void *pBits, const RECT *pSurfaceRect, int pitch, void *pClientData);
 	void DrawChat(Gdiplus::Graphics &g, int width, int height, RECT *prcUnused, RECT *prcUnusedWoShita, bool *pbHasFirstDrawShita);
@@ -141,10 +143,14 @@ private:
 	HBITMAP hbmWork_;
 	void *pBits_;
 	HDC hdcWork_;
+	// 描画状態とGDIオブジェクトの排他制御
+	std::recursive_mutex drawingLock_;
 	std::thread drawingThread_;
 	CAutoResetEvent drawingEvent_;
-	HANDLE hDrawingIdleEvent_;
 	std::atomic_bool bQuitDrawingThread_;
+	bool bAsyncUpdate_;
+	bool bDrawingReady_;
+	DWORD forwardTick_;
 	int commentSizeMin_;
 	int commentSizeMax_;
 	int lineCount_;

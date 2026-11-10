@@ -221,8 +221,10 @@ CCommentWindow::CCommentWindow()
 	, hbmWork_(nullptr)
 	, pBits_(nullptr)
 	, hdcWork_(nullptr)
-	, hDrawingIdleEvent_(nullptr)
 	, bQuitDrawingThread_(false)
+	, bAsyncUpdate_(false)
+	, bDrawingReady_(false)
+	, forwardTick_(0)
 	, commentSizeMin_(1)
 	, commentSizeMax_(INT_MAX)
 	, lineCount_(DEFAULT_LINE_COUNT)
@@ -265,6 +267,7 @@ CCommentWindow::~CCommentWindow()
 
 bool CCommentWindow::Create(HWND hwndParent)
 {
+	lock_recursive_mutex lock(drawingLock_);
 	if (hwnd_) {
 		return true;
 	}
@@ -276,12 +279,9 @@ bool CCommentWindow::Create(HWND hwndParent)
 		if (hwnd_) {
 			if (!bUseOsd_ && bUseDrawingThread_) {
 				drawingEvent_.Reset();
-				hDrawingIdleEvent_ = CreateEvent(nullptr, TRUE, TRUE, nullptr);
-				if (hDrawingIdleEvent_) {
-					bQuitDrawingThread_ = false;
-					drawingThread_ = std::thread([this](){ DrawingThread(); });
-					SetThreadPriority(drawingThread_.native_handle(), THREAD_PRIORITY_ABOVE_NORMAL);
-				}
+				bQuitDrawingThread_ = false;
+				drawingThread_ = std::thread([this](){ DrawingThread(); });
+				SetThreadPriority(drawingThread_.native_handle(), THREAD_PRIORITY_ABOVE_NORMAL);
 			}
 			osdCompositor_.SetContainerWindow(hwndParent_);
 			OnParentSize();
@@ -296,15 +296,17 @@ bool CCommentWindow::Create(HWND hwndParent)
 
 void CCommentWindow::Destroy()
 {
-	if (drawingThread_.joinable()) {
+	{
+		lock_recursive_mutex lock(drawingLock_);
 		bQuitDrawingThread_ = true;
 		drawingEvent_.Set();
+	}
+	if (drawingThread_.joinable()) {
 		drawingThread_.join();
 	}
-	if (hDrawingIdleEvent_) {
-		CloseHandle(hDrawingIdleEvent_);
-		hDrawingIdleEvent_ = nullptr;
-	}
+	lock_recursive_mutex lock(drawingLock_);
+	bAsyncUpdate_ = false;
+	bDrawingReady_ = false;
 	if (hwnd_) {
 		DestroyWindow(hwnd_);
 	}
@@ -335,8 +337,9 @@ void CCommentWindow::Destroy()
 void CCommentWindow::SetStyle(LPCTSTR fontName, LPCTSTR fontNameMulti, LPCTSTR fontNameEmoji, bool bBold, bool bAntiAlias,
                               int fontOutline, bool bUseOsdCompositor, bool bUseTexture, bool bUseDrawingThread)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
 	ClearChat();
+	forwardTick_ = timeGetTime();
 	_tcsncpy_s(fontName_, fontName, _TRUNCATE);
 	_tcsncpy_s(fontNameMulti_, fontNameMulti, _TRUNCATE);
 	_tcsncpy_s(fontNameEmoji_, fontNameEmoji, _TRUNCATE);
@@ -350,7 +353,7 @@ void CCommentWindow::SetStyle(LPCTSTR fontName, LPCTSTR fontNameMulti, LPCTSTR f
 
 void CCommentWindow::SetCommentSize(int size, int sizeMin, int sizeMax, int lineMargin)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
 	ClearChat();
 	commentSizeMin_ = max(sizeMin, 1);
 	commentSizeMax_ = max(sizeMax, 1);
@@ -361,30 +364,31 @@ void CCommentWindow::SetCommentSize(int size, int sizeMin, int sizeMax, int line
 
 void CCommentWindow::SetDrawLineCount(int lineDrawCount)
 {
+	lock_recursive_mutex lock(drawingLock_);
 	lineDrawCount_ = lineDrawCount - 0.5;
 }
 
 void CCommentWindow::SetDisplayDuration(int duration)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
 	displayDuration_ = min(max(duration, 100), 100000);
 }
 
 void CCommentWindow::SetOpacity(BYTE opacity)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
 	opacity_ = opacity;
 }
 
 void CCommentWindow::SetDebugFlags(int debugFlags)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
 	debugFlags_ = debugFlags;
 }
 
 void CCommentWindow::SetCommentHighlight(bool commentHighligh)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
 	hideCommentHighlight_ = commentHighligh;
 }
 
@@ -428,6 +432,7 @@ bool CCommentWindow::AllocateWorkBitmap(int width, int height, bool *pbRealloc)
 
 void CCommentWindow::OnParentMove()
 {
+	lock_recursive_mutex lock(drawingLock_);
 	if (hwnd_) {
 		GetWindowRect(hwndParent_, &rcParent_);
 		SetWindowPos(hwnd_, nullptr, rcParent_.left, rcParent_.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -453,6 +458,8 @@ bool CCommentWindow::IsParentSized()
 
 void CCommentWindow::OnParentSize()
 {
+	lock_recursive_mutex lock(drawingLock_);
+	bDrawingReady_ = false;
 	if (hwnd_) {
 		GetWindowRect(hwndParent_, &rcParent_);
 		if (bUseOsd_ && bShowOsd_) {
@@ -500,6 +507,7 @@ void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, CHAT_POSITION positio
 void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, COLORREF shadowColor, CHAT_POSITION position,
                              CHAT_SIZE size, CHAT_ALIGN align, bool bInsertLast, BYTE backOpacity, int delay, bool bSelfComment)
 {
+	lock_recursive_mutex drawingLock(drawingLock_);
 	if (hwnd_) {
 		std::list<CHAT> lc(1);
 		CHAT &c = lc.front();
@@ -538,6 +546,7 @@ void CCommentWindow::AddChat(LPCTSTR text, COLORREF color, COLORREF shadowColor,
 // 最後に追加された同時刻のコメントの表示タイミングをdurationの範囲内で適当に散らす
 void CCommentWindow::ScatterLatestChats(int duration)
 {
+	lock_recursive_mutex drawingLock(drawingLock_);
 	if (hwnd_ && duration > 0) {
 		lock_recursive_mutex lock(chatLock_);
 		std::list<CHAT>::iterator it = chatPoolList_.begin();
@@ -559,7 +568,8 @@ void CCommentWindow::ScatterLatestChats(int duration)
 
 void CCommentWindow::ClearChat()
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex drawingLock(drawingLock_);
+	lock_recursive_mutex chatLock(chatLock_);
 	chatList_.clear();
 	chatPoolList_.clear();
 	textureList_.clear();
@@ -569,11 +579,20 @@ void CCommentWindow::ClearChat()
 #define DWORD_MSB(x) ((x) & 0x80000000)
 #define DWORD_DIFF(a,b) (DWORD_MSB((a)-(b)) ? -(int)((b)-(a)) : (int)((a)-(b)))
 
-// ウィンドウのタイムスタンプを前進させる
-// スレッドの描画完了を待つので呼ぶタイミングに注意
+// UIスレッドと描画スレッドに共通の経過時間の反映
+void CCommentWindow::Forward()
+{
+	lock_recursive_mutex lock(drawingLock_);
+	DWORD tick = timeGetTime();
+	Forward(static_cast<int>(min(tick - forwardTick_, 5000UL)));
+	forwardTick_ = tick;
+}
+
+// ウィンドウのタイムスタンプの前進
 void CCommentWindow::Forward(int duration)
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex drawingLock(drawingLock_);
+	lock_recursive_mutex chatLock(chatLock_);
 
 	if (duration > 0) {
 		rts_ += duration;
@@ -601,7 +620,8 @@ void CCommentWindow::Forward(int duration)
 
 void CCommentWindow::Update()
 {
-	WaitForIdleDrawingThread();
+	lock_recursive_mutex lock(drawingLock_);
+	bDrawingReady_ = false;
 
 	if (hwnd_ && bUseOsd_) {
 		// OSDに描画
@@ -631,8 +651,6 @@ void CCommentWindow::Update()
 
 void CCommentWindow::UpdateLayeredWindow()
 {
-	ASSERT(!drawingThread_.joinable() || WaitForSingleObject(hDrawingIdleEvent_, 0) == WAIT_OBJECT_0);
-
 	// GDIオブジェクトを確保
 	RECT rc;
 	GetClientRect(hwnd_, &rc);
@@ -652,55 +670,74 @@ void CCommentWindow::UpdateLayeredWindow()
 		SetRect(&rcUnusedIntersect_, 0, 0, width, height);
 		SetRect(&rcDirty_, 0, 0, width, height);
 	}
-	// 1つ前の描画結果を即座に適用することで同期がずれる可能性を下げる
-	SIZE sz = {width, height};
-	POINT ptSrc = {0, 0};
-	BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-	// ダーティ領域を指示すると閑散とした実況で実測25%強軽い
-	HDC hdc = GetDC(hwnd_);
-
-	UPDATELAYEREDWINDOWINFO info;
-	info.cbSize = sizeof(info);
-	info.hdcDst = hdc;
-	info.pptDst = nullptr;
-	info.psize = &sz;
-	info.hdcSrc = hdcWork_;
-	info.pptSrc = &ptSrc;
-	info.crKey = RGB(12, 12, 12);
-	info.pblend = &blend;
-	info.dwFlags = bAntiAlias_ ? ULW_ALPHA : ULW_COLORKEY;
-	info.prcDirty = &rcDirty_;
-	// このAPIはVista以降に存在するがVistaの実装はバグを含むらしい(KB955688)ので注意
-	::UpdateLayeredWindowIndirect(hwnd_, &info);
-
-	ReleaseDC(hwnd_, hdc);
 	SelectObject(hdcWork_, hbmOld);
+	GdiFlush();
+	bDrawingReady_ = true;
+	if (bRealloc) {
+		// レイヤードウィンドウの描画領域のUIスレッドでの確保
+		SIZE size = {width, height};
+		Present(&size);
+	}
+	if (bAsyncUpdate_) return;
 
+	if (!bRealloc) Present();
 	if (drawingThread_.joinable()) {
 		// あとはスレッドに任せる
 		// 目的は高速化ではなくメインスレッドの拘束時間を減らすこと
-		ResetEvent(hDrawingIdleEvent_);
 		drawingEvent_.Set();
 	} else {
 		UpdateChat();
 	}
 }
 
-// 描画スレッド
-void CCommentWindow::DrawingThread()
+// UIスレッドでのサイズ初期化と描画結果の提示
+void CCommentWindow::Present(SIZE *size)
 {
-	while (drawingEvent_.WaitOne() && !bQuitDrawingThread_) {
-		UpdateChat();
-		// これがシグナル状態のとき描画スレッドはメンバ変数にアクセスしてはいけない
-		SetEvent(hDrawingIdleEvent_);
-	}
-	bQuitDrawingThread_ = true;
+	BITMAP bitmap;
+	if (!GetObject(hbmWork_, sizeof(bitmap), &bitmap)) return;
+	SIZE bitmapSize = {bitmap.bmWidth, bitmap.bmHeight};
+	HBITMAP old = static_cast<HBITMAP>(SelectObject(hdcWork_, hbmWork_));
+	POINT source = {0, 0};
+	BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+	UPDATELAYEREDWINDOWINFO info = {};
+	info.cbSize = sizeof(info);
+	info.psize = size ? size : &bitmapSize;
+	info.hdcSrc = hdcWork_;
+	info.pptSrc = &source;
+	info.crKey = RGB(12, 12, 12);
+	info.pblend = &blend;
+	// 描画スレッドからのウィンドウサイズ変更と同期メッセージの抑止
+	info.dwFlags = (bAntiAlias_ ? ULW_ALPHA : ULW_COLORKEY) | (size ? 0 : ULW_EX_NORESIZE);
+	info.prcDirty = &rcDirty_;
+	::UpdateLayeredWindowIndirect(hwnd_, &info);
+	SelectObject(hdcWork_, old);
+	GdiFlush();
 }
 
-// 描画スレッドがアイドル状態になるのを待つ
-bool CCommentWindow::WaitForIdleDrawingThread()
+// UI処理の完了を待たない描画要求の集約
+void CCommentWindow::UpdateAsync()
 {
-	return !drawingThread_.joinable() || bQuitDrawingThread_ || WaitForSingleObject(hDrawingIdleEvent_, INFINITE) == WAIT_OBJECT_0;
+	lock_recursive_mutex lock(drawingLock_);
+	if (!bQuitDrawingThread_ && drawingThread_.joinable()) {
+		bAsyncUpdate_ = true;
+		drawingEvent_.Set();
+	}
+}
+
+// 描画スレッドでの時刻更新・描画・提示
+void CCommentWindow::DrawingThread()
+{
+	while (drawingEvent_.WaitOne()) {
+		lock_recursive_mutex lock(drawingLock_);
+		if (bQuitDrawingThread_) break;
+		if (bAsyncUpdate_) Forward();
+		if (bDrawingReady_) {
+			UpdateChat();
+			if (bAsyncUpdate_) Present();
+		}
+		GdiFlush();
+	}
+	bQuitDrawingThread_ = true;
 }
 
 void CCommentWindow::UpdateChat()
@@ -1218,13 +1255,18 @@ LRESULT CALLBACK CCommentWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 		SetTimer(hwnd, 1, 1000, nullptr);
 		return 0;
 	case WM_DESTROY:
+	{
 		// トップレベルじゃないのでDestroy()以外から他発的に破棄されることもある
 		pThis = reinterpret_cast<CCommentWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+		lock_recursive_mutex lock(pThis->drawingLock_);
 		pThis->hwnd_ = nullptr;
+		pThis->bDrawingReady_ = false;
 		return 0;
+	}
 	case WM_TIMER:
 		if (wParam == 1) {
 			pThis = reinterpret_cast<CCommentWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+			lock_recursive_mutex drawingLock(pThis->drawingLock_);
 			bool bEmpty;
 			{
 				lock_recursive_mutex lock(pThis->chatLock_);
@@ -1238,6 +1280,7 @@ LRESULT CALLBACK CCommentWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 						pThis->bShowOsd_ = false;
 						pThis->osdCompositor_.UpdateSurface();
 					} else {
+						pThis->bDrawingReady_ = false;
 						ShowWindow(hwnd, SW_HIDE);
 					}
 				}
