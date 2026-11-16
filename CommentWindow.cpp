@@ -459,7 +459,7 @@ bool CCommentWindow::GetParentDisplayRect(RECT *pRect) const
 
 void CCommentWindow::OnParentMove()
 {
-	lock_recursive_mutex lock(drawingLock_);
+	// UIスレッド所有の位置・親矩形の更新における描画待ちの回避
 	if (hwnd_) {
 		RECT rc;
 		if (!GetParentDisplayRect(&rc)) return;
@@ -615,7 +615,9 @@ void CCommentWindow::ClearChat()
 // UIスレッドと描画スレッドに共通の経過時間の反映
 void CCommentWindow::Forward()
 {
-	lock_recursive_mutex lock(drawingLock_);
+	// 描画中の時刻更新の委譲と、次回更新時の経過時間の一括反映
+	std::unique_lock<std::recursive_mutex> lock(drawingLock_, std::try_to_lock);
+	if (!lock.owns_lock()) return;
 	DWORD tick = timeGetTime();
 	Forward(static_cast<int>(min(tick - forwardTick_, 5000UL)));
 	forwardTick_ = tick;
@@ -653,7 +655,9 @@ void CCommentWindow::Forward(int duration)
 
 void CCommentWindow::Update()
 {
-	lock_recursive_mutex lock(drawingLock_);
+	// 描画中のUI待ちの回避と、次回更新時の描画準備の再試行
+	std::unique_lock<std::recursive_mutex> lock(drawingLock_, std::try_to_lock);
+	if (!lock.owns_lock()) return;
 	bDrawingReady_ = false;
 
 	if (hwnd_ && bUseOsd_) {
@@ -1300,8 +1304,8 @@ LRESULT CALLBACK CCommentWindow::WndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 	case WM_TIMER:
 		if (wParam == 2) {
 			pThis = reinterpret_cast<CCommentWindow*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
-			lock_recursive_mutex lock(pThis->drawingLock_);
 			// パネル開閉やアスペクト比変更による映像範囲の変化への追従
+			// 矩形確認での描画待ちの回避と、変更時のみのOnParentSize()による排他制御
 			if (pThis->IsParentSized()) pThis->OnParentSize();
 			return 0;
 		}
